@@ -697,11 +697,11 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     const collectFinalText = async (
       cursor: ReturnType<typeof captureSessionCursor>,
     ) => {
-      for (let attempt = 0; attempt < 30; attempt++) {
+      for (let attempt = 0; attempt < 50; attempt++) {
         await refreshMeta();
         const run = sessionRunSince(state.meta.sessionFilePath, cursor);
         if (run.finalText) return run.finalText;
-        await delay(100);
+        await delay(Math.min(100 + attempt * 4, 300));
       }
       return "";
     };
@@ -901,23 +901,90 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           "agent",
           "agent_status",
         );
-        if (status === "working") {
-          response = await waitUntilSettled();
-          status = nestedString(
-            parseJsonOutput(response.stdout),
-            "result",
-            "agent",
-            "agent_status",
-          );
-        }
-        if (status === "blocked") {
-          emit({
-            _tag: "BackendError",
-            message:
-              "Herdr reports that the subagent is waiting for input in its pane.",
-          });
+        let blockedSeen = false;
+
+        while (true) {
+          if (
+            controller.signal.aborted ||
+            !state.activeRun ||
+            serial !== state.runSerial
+          ) {
+            return;
+          }
+          if (status === "working") {
+            response = await waitUntilSettled();
+            status = nestedString(
+              parseJsonOutput(response.stdout),
+              "result",
+              "agent",
+              "agent_status",
+            );
+            continue;
+          }
+          if (status === "blocked") {
+            blockedSeen = true;
+            emit({
+              _tag: "BackendError",
+              message:
+                "Herdr reports that the subagent is waiting for input in its pane.",
+            });
+            response = await runHerdr(
+              [
+                "agent",
+                "wait",
+                agentName,
+                "--until",
+                "idle",
+                "--until",
+                "done",
+              ],
+              { signal: controller.signal },
+            );
+            status = nestedString(
+              parseJsonOutput(response.stdout),
+              "result",
+              "agent",
+              "agent_status",
+            );
+            continue;
+          }
+          if (status !== "idle" && status !== "done") {
+            throw new Error(
+              `Herdr agent ended in unexpected status ${status ?? "unknown"}.`,
+            );
+          }
+
+          const finalText = await collectFinalText(cursor);
+          if (finalText) {
+            emit({
+              _tag: "AssistantMessage",
+              parts: [{ type: "text", text: finalText }],
+            });
+            settle(serial, { _tag: "Completed", finalText });
+            return;
+          }
+          if (!blockedSeen || status === "done") {
+            throw new Error(
+              "Herdr agent became idle without a correlated final response.",
+            );
+          }
+
+          // Planning and permission TUIs can briefly report idle after a menu
+          // response while waiting for parent feedback. Keep the managed run
+          // alive until the next work/blocked transition instead of treating
+          // this input boundary as completion.
           response = await runHerdr(
-            ["agent", "wait", agentName, "--until", "idle", "--until", "done"],
+            [
+              "agent",
+              "wait",
+              agentName,
+              "--until",
+              "working",
+              "--until",
+              "blocked",
+              "--until",
+              "done",
+            ],
             { signal: controller.signal },
           );
           status = nestedString(
@@ -927,28 +994,6 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             "agent_status",
           );
         }
-        if (
-          controller.signal.aborted ||
-          !state.activeRun ||
-          serial !== state.runSerial
-        )
-          return;
-        if (status !== "idle" && status !== "done") {
-          throw new Error(
-            `Herdr agent ended in unexpected status ${status ?? "unknown"}.`,
-          );
-        }
-        const finalText = await collectFinalText(cursor);
-        if (!finalText) {
-          throw new Error(
-            "Herdr agent became idle without a correlated final response.",
-          );
-        }
-        emit({
-          _tag: "AssistantMessage",
-          parts: [{ type: "text", text: finalText }],
-        });
-        settle(serial, { _tag: "Completed", finalText });
       } catch (error) {
         if (
           controller.signal.aborted ||

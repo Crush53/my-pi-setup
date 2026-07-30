@@ -87,7 +87,7 @@ A native child can enter Herdr's `blocked` state for permission prompts, plannin
 2. Read the latest pane snapshot to capture the exact question and options.
 3. The parent agent should answer autonomously from the task, repository, and conversation context. Do not bounce routine planning or implementation decisions back to the user merely because a child asked them.
 4. Ask the user only when the answer requires genuinely user-only information: a personal preference, missing requirement, credential, or authorization for a destructive or irreversible action.
-5. Relay menu navigation with `herdr pane send-keys <pane-id> …`; relay a custom answer with `herdr pane send-text <pane-id> <text>` followed by `herdr pane send-keys <pane-id> enter`.
+5. Relay menu navigation with paced `herdr pane send-keys` calls: send one navigation key per command, pause briefly, read the pane to verify the selector reached the intended option, and only then send Enter. Batched navigation plus Enter can accept the default before the TUI renders movement. Relay a custom answer with `herdr pane send-text <pane-id> <text>` followed by `herdr pane send-keys <pane-id> enter`.
 6. Wait for the child to return to `working`, and repeat if it becomes `blocked` with another question.
 7. Cancel only when explicitly requested or when the child cannot make progress.
 
