@@ -12,7 +12,8 @@ export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "Use subagent_spawn to delegate self-contained tasks that can run in the background; give it a complete, standalone prompt.",
   "Pick the subagent harness deliberately: pi unless you have a reason to prefer Claude Code or Codex (e.g. the user asked for one, or the task suits that harness).",
-  "For native code-review skills, ask Claude Code to use /review, but start a Codex review prompt with $review-agent; Codex /review is an interactive TUI command, not its installed review skill. Inspect the harness's installed SKILL.md when syntax is ambiguous.",
+  "When delegating any named skill or workflow, inspect that harness's installed SKILL.md and use its documented invocation syntax; do not assume conventions transfer between Pi, Claude Code, and Codex.",
+  "For native code-review skills, ask Claude Code to use /review, but start a Codex review prompt with $review-agent; Codex /review is an interactive TUI command, not its installed review skill.",
   "When running inside Herdr, subagent_spawn creates a visible sibling pane for auditing. Input typed directly into a settled child pane is outside Pi's manager and is not collected or delivered; use the managed /subagents controls for follow-up turns.",
   "After subagent_spawn, keep working; results arrive automatically. Only call subagent_wait when you cannot proceed without the result.",
 ];

@@ -7,6 +7,10 @@ description: invoke this skill when the user asks you to use subagents
 
 Each subagent has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. When the parent runs inside Herdr, each child is a real interactive agent in a visible sibling pane for live auditing. Use `/subagents` for managed takeover; input typed directly into a settled child pane is not collected by Pi. Outside Herdr, children use headless backends. Give every child a self-contained prompt with paths, constraints, and the expected report.
 
+## Harness Skills
+
+When a user asks any child harness to use a named skill or workflow, inspect that harness's installed `SKILL.md` first and use its documented invocation syntax. Do not assume skill names or invocation conventions transfer between Pi, Claude Code, and Codex.
+
 ## Pi Harness
 
 **Harness:** `pi`
@@ -62,7 +66,6 @@ Use each harness's native review skill with its documented invocation syntax:
 
 - **Claude Code:** explicitly ask Claude to use `/review`; Claude resolves this to `Skill(review)`. If that skill redirects working-branch reviews to `/code-review`, follow the redirect.
 - **Codex:** start the task prompt with `$review-agent`. This invokes `~/.codex/skills/.system/review-agent/SKILL.md`. Do not use `/review` as a Codex skill invocation; `/review` is an interactive TUI command, not the installed review skill.
-- If a requested workflow or skill name is ambiguous, inspect the harness's installed `SKILL.md` before spawning rather than guessing its syntax.
 
 ## Spawn and Manage
 
