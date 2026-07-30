@@ -646,13 +646,17 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     };
 
     const observedPrompt = async (prompt: string) => {
-      await refreshMeta();
-      if (sessionRun(state.meta.sessionFilePath, prompt).promptSeen)
-        return true;
-      const terminal = await readTerminal("recent-unwrapped", 300).catch(
-        () => undefined,
-      );
-      return terminal?.includes(prompt) ?? false;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        await refreshMeta();
+        if (sessionRun(state.meta.sessionFilePath, prompt).promptSeen)
+          return true;
+        const terminal = await readTerminal("recent-unwrapped", 300).catch(
+          () => undefined,
+        );
+        if (terminal?.includes(prompt)) return true;
+        await delay(100);
+      }
+      return false;
     };
 
     const collectFinalText = async (prompt: string) => {
@@ -722,14 +726,23 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           await submitPrompt();
         } catch (error) {
           const warningAccepted = await acceptClaudeWarning();
-          if (
-            !warningAccepted &&
-            !boundedError(error).includes("agent_prompt_stalled")
-          ) {
-            throw error;
+          const promptStalled = boundedError(error).includes(
+            "agent_prompt_stalled",
+          );
+          if (!warningAccepted && !promptStalled) throw error;
+
+          if (warningAccepted) {
+            await delay(2_000);
+            await submitPrompt();
+          } else if (kind === "claude" && paneId) {
+            // Claude renders long/bracketed-paste input as `[Pasted text #N]`.
+            // Herdr can paste it successfully but fail to submit the final
+            // Enter, reporting agent_prompt_stalled while the text is waiting.
+            await runHerdr(["pane", "send-keys", paneId, "enter"]);
+          } else {
+            await delay(2_000);
+            await submitPrompt();
           }
-          await delay(2_000);
-          await submitPrompt();
         }
         if (await acceptClaudeWarning()) await submitPrompt();
 
