@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
+import { resolvePiModel } from "./pi.ts";
 import type {
   BackendName,
   ReasoningEffort,
@@ -48,14 +49,21 @@ function stringValue(value: unknown) {
 }
 
 function boundedError(error: unknown) {
-  return (error instanceof Error ? error.message : String(error)).slice(0, 4096);
+  return (error instanceof Error ? error.message : String(error)).slice(
+    0,
+    4096,
+  );
 }
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-function commandError(args: ReadonlyArray<string>, code: number | null, stderr: string) {
+function commandError(
+  args: ReadonlyArray<string>,
+  code: number | null,
+  stderr: string,
+) {
   const detail = stderr.trim();
   return new Error(
     `herdr ${args.join(" ")} failed (${code === null ? "terminated" : `code ${code}`})${detail ? `: ${detail}` : ""}`,
@@ -84,26 +92,39 @@ function runHerdr(
       options.signal?.removeEventListener("abort", onAbort);
       operation();
     };
-    const onAbort = () => {
+    const terminate = (error: Error) => {
+      if (settled) return;
       try {
         child.kill("SIGTERM");
       } catch {
         // The process may already have exited.
       }
+      const killTimer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The process may already have exited.
+        }
+      }, 500);
+      killTimer.unref();
+      finish(() => reject(error));
     };
+    const onAbort = () => terminate(new Error("Herdr command aborted."));
 
     if (options.signal) {
       if (options.signal.aborted) onAbort();
       else options.signal.addEventListener("abort", onAbort, { once: true });
     }
-    if (options.timeoutMs !== undefined) {
-      timer = setTimeout(() => {
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // The process may already have exited.
-        }
-      }, options.timeoutMs);
+    if (options.timeoutMs !== undefined && !settled) {
+      timer = setTimeout(
+        () =>
+          terminate(
+            new Error(
+              `Herdr command timed out after ${options.timeoutMs} ms: herdr ${args.join(" ")}`,
+            ),
+          ),
+        options.timeoutMs,
+      );
     }
 
     child.stdout.setEncoding("utf8");
@@ -152,7 +173,9 @@ function chooseDirection(layout: JsonRecord) {
   const panes = record(record(layout.result)?.layout)?.panes;
   const currentId = process.env.HERDR_PANE_ID;
   if (Array.isArray(panes)) {
-    const current = panes.map(record).find((pane) => pane?.pane_id === currentId);
+    const current = panes
+      .map(record)
+      .find((pane) => pane?.pane_id === currentId);
     const rect = record(current?.rect);
     const width = typeof rect?.width === "number" ? rect.width : undefined;
     const height = typeof rect?.height === "number" ? rect.height : undefined;
@@ -174,23 +197,20 @@ function normalizedEffortForCodex(effort: ReasoningEffort | undefined) {
   return effort;
 }
 
-function piModel(task: SpawnTask) {
-  if (task.model) {
-    return !task.model.includes("/") && task.parent.inheritedModel
-      ? `${task.parent.inheritedModel.provider}/${task.model}`
-      : task.model;
-  }
-  return task.parent.inheritedModel
-    ? `${task.parent.inheritedModel.provider}/${task.parent.inheritedModel.id}`
-    : undefined;
-}
-
-function modelLabel(kind: BackendName, task: SpawnTask) {
-  if (kind === "pi") return piModel(task) ?? "default";
+function modelLabel(
+  kind: BackendName,
+  task: SpawnTask,
+  resolvedPiModel: string | undefined,
+) {
+  if (kind === "pi") return resolvedPiModel ?? "default";
   return task.model ?? "default";
 }
 
-function agentArguments(kind: BackendName, task: SpawnTask) {
+export function agentArguments(
+  kind: BackendName,
+  task: SpawnTask,
+  resolvedPiModel: string | undefined,
+) {
   if (kind === "pi") {
     const args = [
       "--name",
@@ -199,9 +219,8 @@ function agentArguments(kind: BackendName, task: SpawnTask) {
       CHILD_EXCLUDED_TOOLS,
       task.parent.projectTrusted ? "--approve" : "--no-approve",
     ];
-    const model = piModel(task);
     const thinking = task.reasoningEffort ?? task.parent.inheritedThinkingLevel;
-    if (model) args.push("--model", model);
+    if (resolvedPiModel) args.push("--model", resolvedPiModel);
     if (thinking) args.push("--thinking", thinking);
     return args;
   }
@@ -214,6 +233,7 @@ function agentArguments(kind: BackendName, task: SpawnTask) {
       "--disallowed-tools",
       "Agent,Task",
     ];
+    if (!task.parent.projectTrusted) args.push("--setting-sources", "user");
     if (task.model) args.push("--model", task.model);
     const effort = normalizedEffortForClaude(task.reasoningEffort);
     if (effort) args.push("--effort", effort);
@@ -222,8 +242,10 @@ function agentArguments(kind: BackendName, task: SpawnTask) {
 
   const args = [
     "--dangerously-bypass-approvals-and-sandbox",
-    "--dangerously-bypass-hook-trust",
+    "--disable",
+    "multi_agent",
   ];
+  if (task.parent.projectTrusted) args.push("--dangerously-bypass-hook-trust");
   if (task.model) args.push("--model", task.model);
   const effort = normalizedEffortForCodex(task.reasoningEffort);
   if (effort) args.push("--config", `model_reasoning_effort=\"${effort}\"`);
@@ -264,7 +286,11 @@ function findFileContaining(root: string, needle: string) {
       visited++;
       const candidate = path.join(directory, entry.name);
       if (entry.isDirectory()) pending.push(candidate);
-      else if (entry.isFile() && entry.name.includes(needle) && entry.name.endsWith(".jsonl")) {
+      else if (
+        entry.isFile() &&
+        entry.name.includes(needle) &&
+        entry.name.endsWith(".jsonl")
+      ) {
         return candidate;
       }
     }
@@ -281,7 +307,8 @@ function resolveSessionPath(
   if (session.kind === "path") return session.value;
   if (kind === "claude") return claudeSessionPath(task.cwd, session.value);
   if (kind === "codex") {
-    const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+    const codexHome =
+      process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
     return findFileContaining(path.join(codexHome, "sessions"), session.value);
   }
   return undefined;
@@ -295,7 +322,8 @@ function textParts(content: unknown) {
       const item = record(part);
       const type = stringValue(item?.type);
       const text = stringValue(item?.text);
-      return text && (type === "text" || type === "output_text" || type === "input_text")
+      return text &&
+        (type === "text" || type === "output_text" || type === "input_text")
         ? [text]
         : [];
     })
@@ -345,7 +373,7 @@ function assistantText(entry: JsonRecord) {
   return undefined;
 }
 
-function sessionRun(
+export function sessionRun(
   sessionFilePath: string | undefined,
   prompt: string,
 ): { promptSeen: boolean; finalText?: string } {
@@ -386,13 +414,40 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
   return Effect.gen(function* () {
     if (!herdrAvailable()) {
       return yield* new SpawnError({
-        message: "Herdr subagents require the parent Pi session to run inside a Herdr pane.",
+        message:
+          "Herdr subagents require the parent Pi session to run inside a Herdr pane.",
       });
+    }
+    if (!task.parent.projectTrusted && kind !== "pi") {
+      return yield* new SpawnError({
+        message: `Interactive ${kind} subagents require a trusted working directory.`,
+      });
+    }
+
+    let resolvedPiModel: string | undefined;
+    if (kind === "pi") {
+      const registry = task.parent.modelRegistry;
+      if (!registry) {
+        return yield* new SpawnError({
+          message: "pi backend requires the parent session's model registry.",
+        });
+      }
+      const resolved = yield* Effect.try({
+        try: () =>
+          resolvePiModel(registry, task.model, task.parent.inheritedModel),
+        catch: (error) => new SpawnError({ message: boundedError(error) }),
+      });
+      resolvedPiModel = resolved
+        ? `${resolved.provider}/${resolved.id}`
+        : undefined;
     }
 
     const events = yield* Queue.make<SubagentEvent, Cause.Done>();
     const emit = (event: SubagentEvent) => Queue.offerUnsafe(events, event);
-    const agentName = `pi_${kind}_${randomBytes(4).toString("hex")}`.slice(0, 32);
+    const agentName = `pi_${kind}_${randomBytes(4).toString("hex")}`.slice(
+      0,
+      32,
+    );
     let paneId: string | undefined;
     let runController: AbortController | undefined;
     let liveTimer: ReturnType<typeof setInterval> | undefined;
@@ -405,7 +460,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       activePrompt: task.prompt,
       meta: {
         backend: kind,
-        modelLabel: modelLabel(kind, task),
+        modelLabel: modelLabel(kind, task, resolvedPiModel),
         herdrAgentName: agentName,
       } satisfies SubagentMeta as SubagentMeta,
     };
@@ -415,44 +470,57 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       catch: (error) => new SpawnError({ message: boundedError(error) }),
     });
     const direction = chooseDirection(parseJsonOutput(layout.stdout));
-    const split = yield* Effect.tryPromise({
-      try: () =>
-        runHerdr([
-          "pane",
-          "split",
-          "--current",
-          "--direction",
-          direction,
-          "--cwd",
-          task.cwd,
-          "--no-focus",
-        ]),
-      catch: (error) => new SpawnError({ message: boundedError(error) }),
-    });
-    paneId = nestedString(parseJsonOutput(split.stdout), "result", "pane", "pane_id");
-    if (!paneId) {
-      return yield* new SpawnError({ message: "Herdr pane split returned no pane id." });
-    }
+    paneId = yield* Effect.acquireRelease(
+      Effect.tryPromise({
+        try: async () => {
+          const split = await runHerdr([
+            "pane",
+            "split",
+            "--current",
+            "--direction",
+            direction,
+            "--cwd",
+            task.cwd,
+            "--no-focus",
+          ]);
+          const acquiredPaneId = nestedString(
+            parseJsonOutput(split.stdout),
+            "result",
+            "pane",
+            "pane_id",
+          );
+          if (!acquiredPaneId) {
+            throw new Error("Herdr pane split returned no pane id.");
+          }
+          return acquiredPaneId;
+        },
+        catch: (error) => new SpawnError({ message: boundedError(error) }),
+      }),
+      (acquiredPaneId) =>
+        Effect.promise(() =>
+          runHerdr(["pane", "close", acquiredPaneId], {
+            timeoutMs: 3_000,
+          }).then(
+            () => undefined,
+            () => undefined,
+          ),
+        ),
+    );
     state.meta = { ...state.meta, herdrPaneId: paneId };
 
     yield* Effect.addFinalizer(() =>
-      Effect.promise(async () => {
+      Effect.sync(() => {
         state.closed = true;
         runController?.abort();
         if (liveTimer) clearInterval(liveTimer);
         liveTimer = undefined;
-        if (paneId) {
-          await runHerdr(["pane", "close", paneId], { timeoutMs: 3_000 }).catch(
-            () => undefined,
-          );
-        }
         Queue.endUnsafe(events);
       }),
     );
 
     yield* Effect.tryPromise({
       try: async () => {
-        await runHerdr(["pane", "rename", paneId, `${kind}: ${task.title}`]);
+        await runHerdr(["pane", "rename", paneId!, `${kind}: ${task.title}`]);
         const startArgs = [
           "agent",
           "start",
@@ -464,14 +532,17 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           "--timeout",
           "120000",
           "--",
-          ...agentArguments(kind, task),
+          ...agentArguments(kind, task, resolvedPiModel),
         ];
         for (let attempt = 0; ; attempt++) {
           try {
             await runHerdr(startArgs);
             break;
           } catch (error) {
-            if (attempt >= 20 || !boundedError(error).includes("agent_pane_busy")) {
+            if (
+              attempt >= 20 ||
+              !boundedError(error).includes("agent_pane_busy")
+            ) {
               throw error;
             }
             await delay(100);
@@ -513,15 +584,19 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         // startup work (notably Codex MCP initialization). Prompts sent during
         // that window can be swallowed while startup state changes falsely
         // satisfy agent prompt --wait.
-        await delay(kind === "codex" ? 5_000 : 1_000);
+        await delay(kind === "pi" ? 1_000 : 5_000);
       },
       catch: (error) => new SpawnError({ message: boundedError(error) }),
     });
 
     const refreshMeta = async () => {
       try {
-        const response = await runHerdr(["agent", "get", agentName], { timeoutMs: 3_000 });
-        const agent = record(record(parseJsonOutput(response.stdout).result)?.agent);
+        const response = await runHerdr(["agent", "get", agentName], {
+          timeoutMs: 3_000,
+        });
+        const agent = record(
+          record(parseJsonOutput(response.stdout).result)?.agent,
+        );
         const session = agentSession(agent);
         const sessionFilePath = resolveSessionPath(kind, task, session);
         const patch: Partial<SubagentMeta> = {
@@ -535,7 +610,10 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       }
     };
 
-    const readTerminal = async (source: "visible" | "recent-unwrapped", lines?: number) => {
+    const readTerminal = async (
+      source: "visible" | "recent-unwrapped",
+      lines?: number,
+    ) => {
       if (!paneId) return undefined;
       // Address the pane rather than the agent alias so output remains readable
       // after a CLI exits and Herdr clears the live agent name.
@@ -569,7 +647,8 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
 
     const observedPrompt = async (prompt: string) => {
       await refreshMeta();
-      if (sessionRun(state.meta.sessionFilePath, prompt).promptSeen) return true;
+      if (sessionRun(state.meta.sessionFilePath, prompt).promptSeen)
+        return true;
       const terminal = await readTerminal("recent-unwrapped", 300).catch(
         () => undefined,
       );
@@ -584,11 +663,15 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         await delay(100);
         await refreshMeta();
       }
-      return (await readTerminal("recent-unwrapped", 200).catch(() => undefined)) ?? "";
+      return (
+        (await readTerminal("recent-unwrapped", 200).catch(() => undefined)) ??
+        ""
+      );
     };
 
     const settle = (serial: number, outcome: RunOutcome) => {
-      if (state.closed || !state.activeRun || serial !== state.runSerial) return;
+      if (state.closed || !state.activeRun || serial !== state.runSerial)
+        return;
       state.activeRun = false;
       runController = undefined;
       stopLiveReads();
@@ -596,12 +679,31 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       emit({ _tag: "RunSettled", outcome });
     };
 
-    const waitForRun = async (serial: number, prompt: string, controller: AbortController) => {
+    const waitForRun = async (
+      serial: number,
+      prompt: string,
+      controller: AbortController,
+    ) => {
       try {
-        const promptAndWait = () =>
-          runHerdr(["agent", "prompt", agentName, prompt, "--wait"], {
+        const submitPrompt = () =>
+          runHerdr(["agent", "prompt", agentName, prompt], {
             signal: controller.signal,
           });
+        const waitUntilSettled = () =>
+          runHerdr(
+            [
+              "agent",
+              "wait",
+              agentName,
+              "--until",
+              "idle",
+              "--until",
+              "done",
+              "--until",
+              "blocked",
+            ],
+            { signal: controller.signal },
+          );
         const acceptClaudeWarning = async () => {
           if (kind !== "claude") return false;
           const screen = await readTerminal("visible").catch(() => undefined);
@@ -616,21 +718,27 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           return true;
         };
 
-        let response: CommandResult;
         try {
-          response = await promptAndWait();
+          await submitPrompt();
         } catch (error) {
-          if (!(await acceptClaudeWarning())) throw error;
-          response = await promptAndWait();
+          const warningAccepted = await acceptClaudeWarning();
+          if (
+            !warningAccepted &&
+            !boundedError(error).includes("agent_prompt_stalled")
+          ) {
+            throw error;
+          }
+          await delay(2_000);
+          await submitPrompt();
         }
-        if (await acceptClaudeWarning()) response = await promptAndWait();
+        if (await acceptClaudeWarning()) await submitPrompt();
 
         if (!(await observedPrompt(prompt))) {
           // A still-initializing TUI can consume the submitted bytes without
           // creating a user turn. Give startup one more grace period and retry
           // once, then fail instead of returning the startup screen as success.
           await delay(2_000);
-          response = await promptAndWait();
+          await submitPrompt();
           if (!(await observedPrompt(prompt))) {
             throw new Error(
               "Herdr submitted the prompt, but the native agent did not record it.",
@@ -638,7 +746,46 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           }
         }
 
-        const status = nestedString(
+        // `agent wait --until idle` can otherwise match the pre-run idle state
+        // before Herdr notices the native TUI has started. First observe either
+        // a busy state or an assistant response in the correlated transcript.
+        let completedBeforeWait = false;
+        let workStarted = false;
+        for (let attempt = 0; attempt < 150; attempt++) {
+          await refreshMeta();
+          if (sessionRun(state.meta.sessionFilePath, prompt).finalText) {
+            completedBeforeWait = true;
+            break;
+          }
+          const current = await runHerdr(["agent", "get", agentName], {
+            timeoutMs: 3_000,
+          });
+          const currentStatus = nestedString(
+            parseJsonOutput(current.stdout),
+            "result",
+            "agent",
+            "agent_status",
+          );
+          if (currentStatus === "working" || currentStatus === "blocked") {
+            workStarted = true;
+            break;
+          }
+          await delay(100);
+        }
+        if (!completedBeforeWait && !workStarted) {
+          throw new Error(
+            "Herdr recorded the prompt, but never observed the native agent start work.",
+          );
+        }
+
+        // Do not use `agent prompt --wait`: Herdr applies a finite command
+        // timeout, so long reviews can be reported as failed while the native
+        // agent keeps working in its pane. Submission and completion are two
+        // independently abortable operations instead.
+        let response: CommandResult = completedBeforeWait
+          ? await runHerdr(["agent", "get", agentName], { timeoutMs: 3_000 })
+          : await waitUntilSettled();
+        let status = nestedString(
           parseJsonOutput(response.stdout),
           "result",
           "agent",
@@ -647,22 +794,35 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         if (status === "blocked") {
           emit({
             _tag: "BackendError",
-            message: "Herdr reports that the subagent is waiting for input in its pane.",
+            message:
+              "Herdr reports that the subagent is waiting for input in its pane.",
           });
-          await runHerdr(
-            [
-              "agent",
-              "wait",
-              agentName,
-              "--until",
-              "idle",
-              "--until",
-              "done",
-            ],
+          response = await runHerdr(
+            ["agent", "wait", agentName, "--until", "idle", "--until", "done"],
             { signal: controller.signal },
           );
+          status = nestedString(
+            parseJsonOutput(response.stdout),
+            "result",
+            "agent",
+            "agent_status",
+          );
         }
-        if (controller.signal.aborted || !state.activeRun || serial !== state.runSerial) return;
+        if (
+          controller.signal.aborted ||
+          !state.activeRun ||
+          serial !== state.runSerial
+        )
+          return;
+        const correlatedFinal = sessionRun(
+          state.meta.sessionFilePath,
+          prompt,
+        ).finalText;
+        if (status !== "idle" && !(status === "done" && correlatedFinal)) {
+          throw new Error(
+            `Herdr agent ended in unexpected status ${status ?? "unknown"}.`,
+          );
+        }
         const finalText = await collectFinalText(prompt);
         if (finalText) {
           emit({
@@ -672,13 +832,33 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         }
         settle(serial, { _tag: "Completed", finalText });
       } catch (error) {
-        if (controller.signal.aborted || !state.activeRun || serial !== state.runSerial) return;
+        if (
+          controller.signal.aborted ||
+          !state.activeRun ||
+          serial !== state.runSerial
+        )
+          return;
+        const promptWasSeen = await observedPrompt(prompt).catch(() => false);
         const partialText = await collectFinalText(prompt).catch(() => "");
         settle(serial, {
           _tag: "Failed",
           errorText: boundedError(error),
           partialText: partialText || undefined,
         });
+
+        // A first-turn submission failure has no useful live session to keep.
+        // Close it immediately so the failed manager entry cannot leave an
+        // idle, unmanaged pane behind.
+        if (!promptWasSeen && paneId) {
+          const failedPaneId = paneId;
+          paneId = undefined;
+          await runHerdr(["pane", "close", failedPaneId], {
+            timeoutMs: 3_000,
+          }).catch(() => undefined);
+          state.closed = true;
+          stopLiveReads();
+          Queue.endUnsafe(events);
+        }
       }
     };
 
@@ -718,28 +898,46 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         if (state.closed || !state.activeRun) return;
         const serial = state.runSerial;
         runController?.abort();
+
+        const confirmStopped = async () => {
+          try {
+            const result = await runHerdr(
+              [
+                "agent",
+                "wait",
+                agentName,
+                "--until",
+                "idle",
+                "--until",
+                "done",
+                "--timeout",
+                String(INTERRUPT_TIMEOUT_MS),
+              ],
+              { timeoutMs: INTERRUPT_TIMEOUT_MS + 1_000 },
+            );
+            const status = nestedString(
+              parseJsonOutput(result.stdout),
+              "result",
+              "agent",
+              "agent_status",
+            );
+            return status === "idle" || status === "done";
+          } catch {
+            return false;
+          }
+        };
+
         await runHerdr(["agent", "send-keys", agentName, "esc"], {
           timeoutMs: 3_000,
         }).catch(() => undefined);
-        const wait = runHerdr(
-          [
-            "agent",
-            "wait",
-            agentName,
-            "--until",
-            "idle",
-            "--until",
-            "done",
-            "--timeout",
-            String(INTERRUPT_TIMEOUT_MS),
-          ],
-          { timeoutMs: INTERRUPT_TIMEOUT_MS + 1_000 },
-        );
-        await wait.catch(async () => {
-          await runHerdr(["pane", "send-keys", paneId!, "ctrl+c"], {
+        let stopped = await confirmStopped();
+        if (!stopped && paneId) {
+          await runHerdr(["pane", "send-keys", paneId, "ctrl+c"], {
             timeoutMs: 3_000,
           }).catch(() => undefined);
-        });
+          stopped = await confirmStopped();
+        }
+
         const partialText = await collectFinalText(state.activePrompt).catch(
           () => "",
         );
@@ -747,6 +945,17 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           _tag: "Interrupted",
           partialText: partialText || undefined,
         });
+
+        if (!stopped && paneId) {
+          const unresponsivePaneId = paneId;
+          paneId = undefined;
+          await runHerdr(["pane", "close", unresponsivePaneId], {
+            timeoutMs: 3_000,
+          }).catch(() => undefined);
+          state.closed = true;
+          stopLiveReads();
+          Queue.endUnsafe(events);
+        }
       }),
     } satisfies SubagentSession;
   });
@@ -755,7 +964,11 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
 export function createHerdrBackend(kind: BackendName): SubagentBackend {
   return {
     name: kind,
-    capabilities: { steering: true, modelSelection: true, reasoningEffort: true },
+    capabilities: {
+      steering: true,
+      modelSelection: true,
+      reasoningEffort: true,
+    },
     available: Effect.sync(herdrAvailable),
     spawn: (task) => makeHerdrSession(kind, task),
   };

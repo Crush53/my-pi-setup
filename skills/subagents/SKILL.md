@@ -5,7 +5,7 @@ description: invoke this skill when the user asks you to use subagents
 
 # Subagents
 
-Each subagent has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. When the parent runs inside Herdr, each child is a real interactive agent in a visible sibling pane for live auditing and takeover. Outside Herdr, children use headless backends. Give every child a self-contained prompt with paths, constraints, and the expected report.
+Each subagent has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. When the parent runs inside Herdr, each child is a real interactive agent in a visible sibling pane for live auditing. Use `/subagents` for managed takeover; input typed directly into a settled child pane is not collected by Pi. Outside Herdr, children use headless backends. Give every child a self-contained prompt with paths, constraints, and the expected report.
 
 ## Pi Harness
 

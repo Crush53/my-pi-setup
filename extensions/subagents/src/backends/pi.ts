@@ -61,7 +61,7 @@ type ThinkingLevel = NonNullable<
  * then must be unambiguous across providers. No hint inherits the parent
  * model; with nothing to inherit, the SDK default applies.
  */
-function resolvePiModel(
+export function resolvePiModel(
   registry: ModelRegistry,
   hint: string | undefined,
   inherited: { provider: string; id: string } | undefined,

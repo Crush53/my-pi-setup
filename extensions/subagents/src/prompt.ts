@@ -2,7 +2,7 @@
 
 /** Describes subagent_spawn, including harnesses and the fixed concurrency cap. */
 export const SUBAGENT_SPAWN_TOOL_DESCRIPTION =
-  "Spawn a background subagent with its own context window and the selected harness's normal host permissions. When the parent runs inside Herdr, this starts a real interactive Pi, Claude Code, or Codex process in a visible sibling pane for live auditing and takeover; outside Herdr it uses the original headless backend. Fire-and-forget: this returns immediately with an id. The subagent's final output is queued back to you when it settles, or collect it with subagent_wait. Children cannot orchestrate more agents/workflows or ask the user, and cannot see this conversation, so the prompt must be self-contained. Only use trusted working directories. Max 4 subagents can run concurrently.";
+  "Spawn a background subagent with its own context window and the selected harness's normal host permissions. When the parent runs inside Herdr, this starts a real interactive Pi, Claude Code, or Codex process in a visible sibling pane for live auditing; direct post-settlement pane input is unmanaged. Outside Herdr it uses the original headless backend. Fire-and-forget: this returns immediately with an id. The subagent's final output is queued back to you when it settles, or collect it with subagent_wait. Children cannot orchestrate more agents/workflows or ask the user, and cannot see this conversation, so the prompt must be self-contained. Only use trusted working directories. Max 4 subagents can run concurrently.";
 
 /** Adds background subagent delegation to the parent model's available-tools prompt. */
 export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
@@ -12,7 +12,7 @@ export const SUBAGENT_SPAWN_PROMPT_SNIPPET =
 export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "Use subagent_spawn to delegate self-contained tasks that can run in the background; give it a complete, standalone prompt.",
   "Pick the subagent harness deliberately: pi unless you have a reason to prefer Claude Code or Codex (e.g. the user asked for one, or the task suits that harness).",
-  "When running inside Herdr, subagent_spawn creates a visible sibling pane so the user can audit or interact with the child directly.",
+  "When running inside Herdr, subagent_spawn creates a visible sibling pane for auditing. Input typed directly into a settled child pane is outside Pi's manager and is not collected or delivered; use the managed /subagents controls for follow-up turns.",
   "After subagent_spawn, keep working; results arrive automatically. Only call subagent_wait when you cannot proceed without the result.",
 ];
 
