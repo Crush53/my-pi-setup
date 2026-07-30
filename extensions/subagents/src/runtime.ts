@@ -10,11 +10,15 @@ import { Cause, Exit, Layer, ManagedRuntime, type Effect } from "effect";
 import { BackendRegistry, type SubagentBackend } from "./backend.ts";
 import { claudeBackend } from "./backends/claude.ts";
 import { codexBackend } from "./backends/codex.ts";
+import { createHerdrBackend } from "./backends/herdr.ts";
 import { piBackend } from "./backends/pi.ts";
-import type { BackendName } from "./domain.ts";
+import { BACKEND_NAMES, type BackendName } from "./domain.ts";
 
 const BackendRegistryLive = Layer.sync(BackendRegistry, () => {
-  const backends: SubagentBackend[] = [piBackend, claudeBackend, codexBackend];
+  const backends: SubagentBackend[] =
+    process.env.HERDR_ENV === "1" && process.env.HERDR_PANE_ID
+      ? BACKEND_NAMES.map(createHerdrBackend)
+      : [piBackend, claudeBackend, codexBackend];
   return new Map<BackendName, SubagentBackend>(
     backends.map((backend) => [backend.name, backend]),
   );

@@ -5,13 +5,13 @@ description: invoke this skill when the user asks you to use subagents
 
 # Subagents
 
-Each subagent is headless, has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. Give every child a self-contained prompt with paths, constraints, and the expected report.
+Each subagent has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. When the parent runs inside Herdr, each child is a real interactive agent in a visible sibling pane for live auditing and takeover. Outside Herdr, children use headless backends. Give every child a self-contained prompt with paths, constraints, and the expected report.
 
 ## Pi Harness
 
 **Harness:** `pi`
 **Prompt nicknames:** “pi”, “pi agent”, “pi subagent”
-**Best default:** Use when the user does not request another harness. It inherits the parent model and thinking level when `model` or `reasoning_effort` is omitted.
+**Best default:** Use when the user does not request another harness. It inherits the parent model and thinking level when `model` or `reasoning_effort` is omitted. Inside Herdr it launches an interactive Pi pane; otherwise it uses an in-process Pi session.
 
 Do not use models from the Anthropic provider even if one appears in the model list.
 
@@ -58,7 +58,7 @@ Requires the Codex CLI to be installed and authenticated.
 
 ## Spawn and Manage
 
-Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, and optional `working_dir`, `model`, and `reasoning_effort`. At most four subagents run concurrently.
+Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, and optional `working_dir`, `model`, and `reasoning_effort`. At most four subagents run concurrently. Inside Herdr, the spawn result includes the child pane ID and the user can click or focus that pane to audit the native agent UI.
 
 - `subagent_check({ id })`: peek without blocking.
 - `subagent_list()`: list all runs.

@@ -364,6 +364,12 @@ const makeManager = Effect.gen(function* () {
         s.liveAssistant = undefined;
         s.turns++;
         break;
+      case "LiveSnapshot":
+        s.liveAssistant = {
+          text: event.text.slice(-LIVE_ASSISTANT_MAX_LENGTH),
+          thinking: "",
+        };
+        break;
       case "ToolStart":
         entry.liveToolMap.set(event.toolId, {
           toolId: event.toolId,

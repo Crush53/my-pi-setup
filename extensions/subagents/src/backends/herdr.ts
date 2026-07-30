@@ -1,0 +1,696 @@
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { randomBytes } from "node:crypto";
+import type { Cause, Scope } from "effect";
+import { Effect, Queue, Stream } from "effect";
+import type { SubagentBackend, SubagentSession } from "../backend.ts";
+import type {
+  BackendName,
+  ReasoningEffort,
+  RunOutcome,
+  SpawnTask,
+  SubagentEvent,
+  SubagentMeta,
+} from "../domain.ts";
+import { SendError, SpawnError } from "../domain.ts";
+
+const COMMAND_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
+const LIVE_READ_INTERVAL_MS = 500;
+const INTERRUPT_TIMEOUT_MS = 5_000;
+const FINAL_OUTPUT_MAX_LENGTH = 1024 * 1024;
+const CHILD_EXCLUDED_TOOLS = [
+  "subagent_spawn",
+  "subagent_wait",
+  "subagent_cancel",
+  "subagent_check",
+  "subagent_list",
+  "workflow",
+  "ask_user",
+].join(",");
+
+interface CommandResult {
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+type JsonRecord = Record<string, unknown>;
+
+function record(value: unknown): JsonRecord | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : undefined;
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value : undefined;
+}
+
+function boundedError(error: unknown) {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 4096);
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function commandError(args: ReadonlyArray<string>, code: number | null, stderr: string) {
+  const detail = stderr.trim();
+  return new Error(
+    `herdr ${args.join(" ")} failed (${code === null ? "terminated" : `code ${code}`})${detail ? `: ${detail}` : ""}`,
+  );
+}
+
+function runHerdr(
+  args: ReadonlyArray<string>,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+) {
+  return new Promise<CommandResult>((resolve, reject) => {
+    const child = spawn("herdr", [...args], {
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (operation: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const onAbort = () => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // The process may already have exited.
+      }
+    };
+
+    if (options.signal) {
+      if (options.signal.aborted) onAbort();
+      else options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    if (options.timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // The process may already have exited.
+        }
+      }, options.timeoutMs);
+    }
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout = `${stdout}${chunk}`.slice(-COMMAND_OUTPUT_MAX_BYTES);
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr = `${stderr}${chunk}`.slice(-COMMAND_OUTPUT_MAX_BYTES);
+    });
+    child.once("error", (error) => finish(() => reject(error)));
+    child.once("exit", (code) => {
+      finish(() => {
+        if (options.signal?.aborted) {
+          reject(new Error("Herdr command aborted."));
+        } else if (code === 0) {
+          resolve({ stdout, stderr });
+        } else {
+          reject(commandError(args, code, stderr));
+        }
+      });
+    });
+  });
+}
+
+function parseJsonOutput(output: string) {
+  const lines = output.split("\n");
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]?.trim();
+    if (line) return JSON.parse(line) as JsonRecord;
+  }
+  throw new Error("Herdr returned no JSON response.");
+}
+
+function nestedString(value: unknown, ...keys: string[]) {
+  let current: unknown = value;
+  for (const key of keys) current = record(current)?.[key];
+  return stringValue(current);
+}
+
+function herdrAvailable() {
+  return process.env.HERDR_ENV === "1" && Boolean(process.env.HERDR_PANE_ID);
+}
+
+function chooseDirection(layout: JsonRecord) {
+  const panes = record(record(layout.result)?.layout)?.panes;
+  const currentId = process.env.HERDR_PANE_ID;
+  if (Array.isArray(panes)) {
+    const current = panes.map(record).find((pane) => pane?.pane_id === currentId);
+    const rect = record(current?.rect);
+    const width = typeof rect?.width === "number" ? rect.width : undefined;
+    const height = typeof rect?.height === "number" ? rect.height : undefined;
+    if (width !== undefined && height !== undefined) {
+      return width >= 100 && width >= height * 1.6 ? "right" : "down";
+    }
+  }
+  return "right";
+}
+
+function normalizedEffortForClaude(effort: ReasoningEffort | undefined) {
+  if (effort === "off" || effort === "minimal") return "low";
+  return effort;
+}
+
+function normalizedEffortForCodex(effort: ReasoningEffort | undefined) {
+  if (effort === "off") return "none";
+  if (effort === "minimal") return "low";
+  return effort;
+}
+
+function piModel(task: SpawnTask) {
+  if (task.model) {
+    return !task.model.includes("/") && task.parent.inheritedModel
+      ? `${task.parent.inheritedModel.provider}/${task.model}`
+      : task.model;
+  }
+  return task.parent.inheritedModel
+    ? `${task.parent.inheritedModel.provider}/${task.parent.inheritedModel.id}`
+    : undefined;
+}
+
+function modelLabel(kind: BackendName, task: SpawnTask) {
+  if (kind === "pi") return piModel(task) ?? "default";
+  return task.model ?? "default";
+}
+
+function agentArguments(kind: BackendName, task: SpawnTask) {
+  if (kind === "pi") {
+    const args = [
+      "--name",
+      `subagent: ${task.title}`,
+      "--exclude-tools",
+      CHILD_EXCLUDED_TOOLS,
+      task.parent.projectTrusted ? "--approve" : "--no-approve",
+    ];
+    const model = piModel(task);
+    const thinking = task.reasoningEffort ?? task.parent.inheritedThinkingLevel;
+    if (model) args.push("--model", model);
+    if (thinking) args.push("--thinking", thinking);
+    return args;
+  }
+
+  if (kind === "claude") {
+    const args = [
+      "--name",
+      `subagent: ${task.title}`,
+      "--dangerously-skip-permissions",
+      "--disallowed-tools",
+      "Agent,Task",
+    ];
+    if (task.model) args.push("--model", task.model);
+    const effort = normalizedEffortForClaude(task.reasoningEffort);
+    if (effort) args.push("--effort", effort);
+    return args;
+  }
+
+  const args = [
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
+  ];
+  if (task.model) args.push("--model", task.model);
+  const effort = normalizedEffortForCodex(task.reasoningEffort);
+  if (effort) args.push("--config", `model_reasoning_effort=\"${effort}\"`);
+  return args;
+}
+
+function agentSession(agent: JsonRecord | undefined) {
+  const session = record(agent?.agent_session);
+  const kind = stringValue(session?.kind);
+  const value = stringValue(session?.value);
+  return kind && value ? { kind, value } : undefined;
+}
+
+function claudeSessionPath(cwd: string, sessionId: string) {
+  const projectDirectory = cwd.replace(/[/.]/g, "-");
+  return path.join(
+    process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
+    "projects",
+    projectDirectory,
+    `${sessionId}.jsonl`,
+  );
+}
+
+function findFileContaining(root: string, needle: string) {
+  if (!fs.existsSync(root)) return undefined;
+  const pending = [root];
+  let visited = 0;
+  while (pending.length > 0 && visited < 20_000) {
+    const directory = pending.pop();
+    if (!directory) break;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      visited++;
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(candidate);
+      else if (entry.isFile() && entry.name.includes(needle) && entry.name.endsWith(".jsonl")) {
+        return candidate;
+      }
+    }
+  }
+  return undefined;
+}
+
+function resolveSessionPath(
+  kind: BackendName,
+  task: SpawnTask,
+  session: { kind: string; value: string } | undefined,
+) {
+  if (!session) return undefined;
+  if (session.kind === "path") return session.value;
+  if (kind === "claude") return claudeSessionPath(task.cwd, session.value);
+  if (kind === "codex") {
+    const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+    return findFileContaining(path.join(codexHome, "sessions"), session.value);
+  }
+  return undefined;
+}
+
+function textParts(content: unknown) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .flatMap((part) => {
+      const item = record(part);
+      const type = stringValue(item?.type);
+      const text = stringValue(item?.text);
+      return text && (type === "text" || type === "output_text" || type === "input_text")
+        ? [text]
+        : [];
+    })
+    .join("\n")
+    .trim();
+}
+
+function assistantText(entry: JsonRecord) {
+  const message = record(entry.message);
+  if (message?.role === "assistant") {
+    const text = textParts(message.content);
+    if (text) return text;
+  }
+
+  const payload = record(entry.payload);
+  if (entry.type === "response_item" && payload?.role === "assistant") {
+    const text = textParts(payload.content);
+    if (text) return text;
+  }
+  if (entry.type === "event_msg" && payload?.type === "agent_message") {
+    const text = stringValue(payload.message);
+    if (text?.trim()) return text.trim();
+  }
+  if (entry.type === "result") {
+    const text = stringValue(entry.result);
+    if (text?.trim()) return text.trim();
+  }
+  return undefined;
+}
+
+function finalTextFromSession(sessionFilePath: string | undefined) {
+  if (!sessionFilePath || !fs.existsSync(sessionFilePath)) return undefined;
+  let contents: string;
+  try {
+    contents = fs.readFileSync(sessionFilePath, "utf8");
+  } catch {
+    return undefined;
+  }
+  const lines = contents.split("\n");
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]?.trim();
+    if (!line) continue;
+    try {
+      const text = assistantText(JSON.parse(line) as JsonRecord);
+      if (text) return text.slice(0, FINAL_OUTPUT_MAX_LENGTH);
+    } catch {
+      // Ignore malformed or partially flushed trailing records.
+    }
+  }
+  return undefined;
+}
+
+function makeHerdrSession(kind: BackendName, task: SpawnTask) {
+  return Effect.gen(function* () {
+    if (!herdrAvailable()) {
+      return yield* new SpawnError({
+        message: "Herdr subagents require the parent Pi session to run inside a Herdr pane.",
+      });
+    }
+
+    const events = yield* Queue.make<SubagentEvent, Cause.Done>();
+    const emit = (event: SubagentEvent) => Queue.offerUnsafe(events, event);
+    const agentName = `pi_${kind}_${randomBytes(4).toString("hex")}`.slice(0, 32);
+    let paneId: string | undefined;
+    let runController: AbortController | undefined;
+    let liveTimer: ReturnType<typeof setInterval> | undefined;
+    let liveReadPending = false;
+
+    const state = {
+      closed: false,
+      activeRun: false,
+      runSerial: 0,
+      meta: {
+        backend: kind,
+        modelLabel: modelLabel(kind, task),
+        herdrAgentName: agentName,
+      } satisfies SubagentMeta as SubagentMeta,
+    };
+
+    const layout = yield* Effect.tryPromise({
+      try: () => runHerdr(["pane", "layout", "--current"]),
+      catch: (error) => new SpawnError({ message: boundedError(error) }),
+    });
+    const direction = chooseDirection(parseJsonOutput(layout.stdout));
+    const split = yield* Effect.tryPromise({
+      try: () =>
+        runHerdr([
+          "pane",
+          "split",
+          "--current",
+          "--direction",
+          direction,
+          "--cwd",
+          task.cwd,
+          "--no-focus",
+        ]),
+      catch: (error) => new SpawnError({ message: boundedError(error) }),
+    });
+    paneId = nestedString(parseJsonOutput(split.stdout), "result", "pane", "pane_id");
+    if (!paneId) {
+      return yield* new SpawnError({ message: "Herdr pane split returned no pane id." });
+    }
+    state.meta = { ...state.meta, herdrPaneId: paneId };
+
+    yield* Effect.addFinalizer(() =>
+      Effect.promise(async () => {
+        state.closed = true;
+        runController?.abort();
+        if (liveTimer) clearInterval(liveTimer);
+        liveTimer = undefined;
+        if (paneId) {
+          await runHerdr(["pane", "close", paneId], { timeoutMs: 3_000 }).catch(
+            () => undefined,
+          );
+        }
+        Queue.endUnsafe(events);
+      }),
+    );
+
+    yield* Effect.tryPromise({
+      try: async () => {
+        await runHerdr(["pane", "rename", paneId, `${kind}: ${task.title}`]);
+        const startArgs = [
+          "agent",
+          "start",
+          agentName,
+          "--kind",
+          kind,
+          "--pane",
+          paneId!,
+          "--timeout",
+          "120000",
+          "--",
+          ...agentArguments(kind, task),
+        ];
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await runHerdr(startArgs);
+            break;
+          } catch (error) {
+            if (attempt >= 20 || !boundedError(error).includes("agent_pane_busy")) {
+              throw error;
+            }
+            await delay(100);
+          }
+        }
+
+        if (kind === "claude") {
+          for (let attempt = 0; attempt < 30; attempt++) {
+            const screen = await runHerdr([
+              "pane",
+              "read",
+              paneId!,
+              "--source",
+              "visible",
+            ]).then((result) => result.stdout);
+            if (
+              screen.includes("Bypass Permissions mode") &&
+              screen.includes("Yes, I accept")
+            ) {
+              await runHerdr(["pane", "send-keys", paneId!, "down", "enter"]);
+              await runHerdr([
+                "agent",
+                "wait",
+                agentName,
+                "--until",
+                "idle",
+                "--until",
+                "done",
+                "--timeout",
+                "30000",
+              ]);
+              break;
+            }
+            await delay(100);
+          }
+        }
+      },
+      catch: (error) => new SpawnError({ message: boundedError(error) }),
+    });
+
+    const refreshMeta = async () => {
+      try {
+        const response = await runHerdr(["agent", "get", agentName], { timeoutMs: 3_000 });
+        const agent = record(record(parseJsonOutput(response.stdout).result)?.agent);
+        const session = agentSession(agent);
+        const sessionFilePath = resolveSessionPath(kind, task, session);
+        const patch: Partial<SubagentMeta> = {
+          nativeSessionId: session?.kind === "id" ? session.value : undefined,
+          sessionFilePath,
+        };
+        state.meta = { ...state.meta, ...patch };
+        emit({ _tag: "MetaChanged", meta: patch });
+      } catch {
+        // Session identity is best-effort; terminal output remains the fallback.
+      }
+    };
+
+    const readTerminal = async (source: "visible" | "recent-unwrapped", lines?: number) => {
+      if (!paneId) return undefined;
+      // Address the pane rather than the agent alias so output remains readable
+      // after a CLI exits and Herdr clears the live agent name.
+      const args = ["pane", "read", paneId, "--source", source];
+      if (lines !== undefined) args.push("--lines", String(lines));
+      const result = await runHerdr(args, { timeoutMs: 3_000 });
+      return result.stdout.trim();
+    };
+
+    const stopLiveReads = () => {
+      if (liveTimer) clearInterval(liveTimer);
+      liveTimer = undefined;
+      liveReadPending = false;
+    };
+
+    const startLiveReads = () => {
+      stopLiveReads();
+      liveTimer = setInterval(() => {
+        if (state.closed || !state.activeRun || liveReadPending) return;
+        liveReadPending = true;
+        void readTerminal("visible")
+          .then((text) => {
+            if (text && state.activeRun) emit({ _tag: "LiveSnapshot", text });
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            liveReadPending = false;
+          });
+      }, LIVE_READ_INTERVAL_MS);
+    };
+
+    const collectFinalText = async () => {
+      await refreshMeta();
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const text = finalTextFromSession(state.meta.sessionFilePath);
+        if (text) return text;
+        await delay(100);
+        await refreshMeta();
+      }
+      return (await readTerminal("recent-unwrapped", 200).catch(() => undefined)) ?? "";
+    };
+
+    const settle = (serial: number, outcome: RunOutcome) => {
+      if (state.closed || !state.activeRun || serial !== state.runSerial) return;
+      state.activeRun = false;
+      runController = undefined;
+      stopLiveReads();
+      emit({ _tag: "QueueChanged", queued: [] });
+      emit({ _tag: "RunSettled", outcome });
+    };
+
+    const waitForRun = async (serial: number, prompt: string, controller: AbortController) => {
+      try {
+        const promptAndWait = () =>
+          runHerdr(["agent", "prompt", agentName, prompt, "--wait"], {
+            signal: controller.signal,
+          });
+        const acceptClaudeWarning = async () => {
+          if (kind !== "claude") return false;
+          const screen = await readTerminal("visible").catch(() => undefined);
+          if (
+            !screen?.includes("Bypass Permissions mode") ||
+            !screen.includes("Yes, I accept")
+          ) {
+            return false;
+          }
+          await runHerdr(["pane", "send-keys", paneId!, "down", "enter"]);
+          await delay(500);
+          return true;
+        };
+
+        let response: CommandResult;
+        try {
+          response = await promptAndWait();
+        } catch (error) {
+          if (!(await acceptClaudeWarning())) throw error;
+          response = await promptAndWait();
+        }
+        if (await acceptClaudeWarning()) response = await promptAndWait();
+
+        const status = nestedString(
+          parseJsonOutput(response.stdout),
+          "result",
+          "agent",
+          "agent_status",
+        );
+        if (status === "blocked") {
+          emit({
+            _tag: "BackendError",
+            message: "Herdr reports that the subagent is waiting for input in its pane.",
+          });
+          await runHerdr(
+            [
+              "agent",
+              "wait",
+              agentName,
+              "--until",
+              "idle",
+              "--until",
+              "done",
+            ],
+            { signal: controller.signal },
+          );
+        }
+        if (controller.signal.aborted || !state.activeRun || serial !== state.runSerial) return;
+        const finalText = await collectFinalText();
+        if (finalText) {
+          emit({
+            _tag: "AssistantMessage",
+            parts: [{ type: "text", text: finalText }],
+          });
+        }
+        settle(serial, { _tag: "Completed", finalText });
+      } catch (error) {
+        if (controller.signal.aborted || !state.activeRun || serial !== state.runSerial) return;
+        const partialText = await collectFinalText().catch(() => "");
+        settle(serial, {
+          _tag: "Failed",
+          errorText: boundedError(error),
+          partialText: partialText || undefined,
+        });
+      }
+    };
+
+    const startRun = (prompt: string) => {
+      const serial = ++state.runSerial;
+      state.activeRun = true;
+      runController = new AbortController();
+      emit({ _tag: "UserMessage", text: prompt });
+      emit({ _tag: "RunStarted" });
+      startLiveReads();
+      void waitForRun(serial, prompt, runController);
+    };
+
+    emit({ _tag: "MetaChanged", meta: state.meta });
+    yield* Effect.promise(refreshMeta);
+    startRun(task.prompt);
+
+    return {
+      meta: Effect.sync(() => state.meta),
+      events: Stream.fromQueue(events),
+      send: (text) =>
+        Effect.tryPromise({
+          try: async () => {
+            if (state.closed) throw new Error("Subagent session is closed.");
+            if (!state.activeRun) {
+              startRun(text);
+              return;
+            }
+            await runHerdr(["agent", "prompt", agentName, text]);
+            emit({ _tag: "UserMessage", text });
+            emit({ _tag: "QueueChanged", queued: [{ text, kind: "steer" }] });
+          },
+          catch: (error) => new SendError({ message: boundedError(error) }),
+        }),
+      interrupt: Effect.promise(async () => {
+        if (state.closed || !state.activeRun) return;
+        const serial = state.runSerial;
+        runController?.abort();
+        await runHerdr(["agent", "send-keys", agentName, "esc"], {
+          timeoutMs: 3_000,
+        }).catch(() => undefined);
+        const wait = runHerdr(
+          [
+            "agent",
+            "wait",
+            agentName,
+            "--until",
+            "idle",
+            "--until",
+            "done",
+            "--timeout",
+            String(INTERRUPT_TIMEOUT_MS),
+          ],
+          { timeoutMs: INTERRUPT_TIMEOUT_MS + 1_000 },
+        );
+        await wait.catch(async () => {
+          await runHerdr(["pane", "send-keys", paneId!, "ctrl+c"], {
+            timeoutMs: 3_000,
+          }).catch(() => undefined);
+        });
+        const partialText = await collectFinalText().catch(() => "");
+        settle(serial, {
+          _tag: "Interrupted",
+          partialText: partialText || undefined,
+        });
+      }),
+    } satisfies SubagentSession;
+  });
+}
+
+export function createHerdrBackend(kind: BackendName): SubagentBackend {
+  return {
+    name: kind,
+    capabilities: { steering: true, modelSelection: true, reasoningEffort: true },
+    available: Effect.sync(herdrAvailable),
+    spawn: (task) => makeHerdrSession(kind, task),
+  };
+}

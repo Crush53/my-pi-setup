@@ -15,9 +15,9 @@
  *
  * Architecture: Effect v4 generators throughout (backends -> manager ->
  * runtime); this file is the async boundary where tool handlers run effects
- * against one shared ManagedRuntime. All three backends are real: pi runs
- * in-process SDK sessions, claude drives the Claude Agent SDK, codex speaks
- * JSON-RPC to a scoped `codex app-server` process.
+ * against one shared ManagedRuntime. Inside Herdr, all harnesses launch their
+ * real interactive CLIs in visible panes. Outside Herdr, pi runs in-process,
+ * Claude uses its Agent SDK, and Codex uses `codex app-server` JSON-RPC.
  */
 
 import * as fs from "node:fs";
@@ -96,6 +96,7 @@ function describeSubagent(snap: SubagentSnapshot) {
     formatContextUtilization(snap.usage),
     formatElapsed(snap),
     snap.cwd,
+    snap.meta.herdrPaneId ? `pane ${snap.meta.herdrPaneId}` : undefined,
   ].filter(Boolean);
   return `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
 }
@@ -341,6 +342,7 @@ export default function (pi: ExtensionAPI) {
               harness,
               modelLabel: snap.meta.modelLabel ?? "?",
               cwd,
+              herdrPaneId: snap.meta.herdrPaneId,
             }),
           },
         ],
@@ -350,6 +352,8 @@ export default function (pi: ExtensionAPI) {
           cwd,
           harness,
           model: snap.meta.modelLabel,
+          herdrPaneId: snap.meta.herdrPaneId,
+          herdrAgentName: snap.meta.herdrAgentName,
         },
       };
     },
