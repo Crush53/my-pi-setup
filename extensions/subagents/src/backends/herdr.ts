@@ -21,6 +21,9 @@ import { SendError, SpawnError } from "../domain.ts";
 const COMMAND_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
 const LIVE_READ_INTERVAL_MS = 500;
 const INTERRUPT_STAGE_TIMEOUT_MS = 750;
+const MONITOR_RETRY_ATTEMPTS = 3;
+const MONITOR_RETRY_DELAY_MS = 150;
+const CODEX_PATH_CACHE_RETRY_MS = 1_000;
 const FINAL_OUTPUT_MAX_LENGTH = 1024 * 1024;
 const CHILD_EXCLUDED_TOOLS = [
   "subagent_spawn",
@@ -56,8 +59,42 @@ function boundedError(error: unknown) {
   );
 }
 
+export function isMissingHerdrTarget(error: unknown) {
+  const message = boundedError(error);
+  return (
+    message.includes('"code":"agent_not_found"') ||
+    message.includes('"code":"pane_not_found"')
+  );
+}
+
+function isAbortedHerdrCommand(error: unknown) {
+  return boundedError(error).includes("Herdr command aborted.");
+}
+
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+export async function retryHerdrMonitoring<A>(
+  operation: () => Promise<A>,
+  signal?: AbortSignal,
+) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MONITOR_RETRY_ATTEMPTS; attempt++) {
+    if (signal?.aborted) throw new Error("Herdr command aborted.");
+    try {
+      return await operation();
+    } catch (error) {
+      if (isMissingHerdrTarget(error) || isAbortedHerdrCommand(error)) {
+        throw error;
+      }
+      lastError = error;
+      if (attempt + 1 < MONITOR_RETRY_ATTEMPTS) {
+        await delay(MONITOR_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+  }
+  throw lastError;
 }
 
 function commandError(
@@ -187,9 +224,20 @@ function chooseDirection(layout: JsonRecord) {
   return "right";
 }
 
-function normalizedEffortForClaude(effort: ReasoningEffort | undefined) {
-  if (effort === "off" || effort === "minimal") return "low";
-  return effort;
+export function normalizedEffortForClaude(effort: ReasoningEffort | undefined) {
+  switch (effort) {
+    case "off":
+    case "minimal":
+      return "low";
+    case "low":
+    case "medium":
+    case "high":
+    case "xhigh":
+    case "max":
+      return effort;
+    case undefined:
+      return undefined;
+  }
 }
 
 function modelLabel(
@@ -269,6 +317,11 @@ export function claudeSessionPath(cwd: string, sessionId: string) {
   );
 }
 
+const codexSessionPathCache = new Map<
+  string,
+  { readonly checkedAt: number; readonly sessionFilePath?: string }
+>();
+
 function findFileContaining(root: string, needle: string) {
   if (!fs.existsSync(root)) return undefined;
   const pending = [root];
@@ -309,7 +362,21 @@ function resolveSessionPath(
   if (kind === "codex") {
     const codexHome =
       process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
-    return findFileContaining(path.join(codexHome, "sessions"), session.value);
+    const sessionsRoot = path.join(codexHome, "sessions");
+    const cacheKey = `${sessionsRoot}\0${session.value}`;
+    const cached = codexSessionPathCache.get(cacheKey);
+    if (cached?.sessionFilePath && fs.existsSync(cached.sessionFilePath)) {
+      return cached.sessionFilePath;
+    }
+    if (cached && Date.now() - cached.checkedAt < CODEX_PATH_CACHE_RETRY_MS) {
+      return cached.sessionFilePath;
+    }
+    const sessionFilePath = findFileContaining(sessionsRoot, session.value);
+    codexSessionPathCache.set(cacheKey, {
+      checkedAt: Date.now(),
+      sessionFilePath,
+    });
+    return sessionFilePath;
   }
   return undefined;
 }
@@ -350,27 +417,75 @@ function userText(entry: JsonRecord) {
   return undefined;
 }
 
-function assistantText(entry: JsonRecord) {
+function promptMatches(
+  kind: BackendName,
+  expectedPrompt: string | undefined,
+  actualPrompt: string,
+) {
+  if (expectedPrompt === undefined) return false;
+  const expected = expectedPrompt.trim();
+  const actual = actualPrompt.trim();
+  if (actual === expected) return true;
+
+  if (kind === "claude" && expected.startsWith("/")) {
+    const separator = expected.search(/\s/);
+    const command = separator < 0 ? expected : expected.slice(0, separator);
+    const args = separator < 0 ? "" : expected.slice(separator).trim();
+    return (
+      actual.includes(`<command-name>${command}</command-name>`) &&
+      (!args || actual.includes(`<command-args>${args}</command-args>`))
+    );
+  }
+  return false;
+}
+
+function assistantRecord(kind: BackendName, entry: JsonRecord) {
   const message = record(entry.message);
-  if (message?.role === "assistant") {
-    const text = textParts(message.content);
-    if (text) return text;
+  const payload = record(entry.payload);
+  let text: string | undefined;
+  let terminal = false;
+
+  if (
+    kind === "pi" &&
+    entry.type === "message" &&
+    message?.role === "assistant"
+  ) {
+    text = textParts(message.content) || undefined;
+    terminal = message.stopReason === "stop" || message.stopReason === "length";
+  } else if (
+    kind === "claude" &&
+    entry.type === "assistant" &&
+    message?.role === "assistant"
+  ) {
+    text = textParts(message.content) || undefined;
+    terminal =
+      message.stop_reason === "end_turn" ||
+      message.stop_reason === "stop_sequence";
+  } else if (
+    kind === "codex" &&
+    entry.type === "response_item" &&
+    payload?.type === "message" &&
+    payload.role === "assistant"
+  ) {
+    text = textParts(payload.content) || undefined;
+    terminal = payload.phase === "final_answer";
+  } else if (
+    kind === "codex" &&
+    entry.type === "event_msg" &&
+    payload?.type === "agent_message"
+  ) {
+    text = stringValue(payload.message)?.trim() || undefined;
+    terminal = payload.phase === "final_answer";
+  } else if (
+    kind === "codex" &&
+    entry.type === "event_msg" &&
+    payload?.type === "task_complete"
+  ) {
+    text = stringValue(payload.last_agent_message)?.trim() || undefined;
+    terminal = Boolean(text);
   }
 
-  const payload = record(entry.payload);
-  if (entry.type === "response_item" && payload?.role === "assistant") {
-    const text = textParts(payload.content);
-    if (text) return text;
-  }
-  if (entry.type === "event_msg" && payload?.type === "agent_message") {
-    const text = stringValue(payload.message);
-    if (text?.trim()) return text.trim();
-  }
-  if (entry.type === "result") {
-    const text = stringValue(entry.result);
-    if (text?.trim()) return text.trim();
-  }
-  return undefined;
+  return { text, terminal };
 }
 
 export function captureSessionCursor(sessionFilePath: string | undefined) {
@@ -383,12 +498,13 @@ export function captureSessionCursor(sessionFilePath: string | undefined) {
 }
 
 export function sessionRunSince(
+  kind: BackendName,
   sessionFilePath: string | undefined,
   cursor: ReturnType<typeof captureSessionCursor>,
   expectedPrompt?: string,
 ) {
   if (!sessionFilePath || !fs.existsSync(sessionFilePath)) {
-    return { userSeen: false, promptSeen: false };
+    return { userSeen: false, promptSeen: false, matchingPromptCount: 0 };
   }
   let contents: string;
   try {
@@ -399,11 +515,13 @@ export function sessionRunSince(
         : 0;
     contents = bytes.subarray(offset).toString("utf8");
   } catch {
-    return { userSeen: false, promptSeen: false };
+    return { userSeen: false, promptSeen: false, matchingPromptCount: 0 };
   }
 
   let userSeen = false;
   let promptSeen = false;
+  let matchingPromptCount = 0;
+  let partialText: string | undefined;
   let finalText: string | undefined;
   for (const rawLine of contents.split("\n")) {
     const line = rawLine.trim();
@@ -413,18 +531,61 @@ export function sessionRunSince(
       const user = userText(entry);
       if (user) {
         userSeen = true;
-        promptSeen ||= user.trim() === expectedPrompt?.trim();
-        finalText = undefined;
+        const matches = promptMatches(kind, expectedPrompt, user);
+        if (matches) matchingPromptCount++;
+        if (promptSeen || matches) {
+          promptSeen = true;
+          partialText = undefined;
+          finalText = undefined;
+        }
         continue;
       }
-      if (!userSeen) continue;
-      const assistant = assistantText(entry);
-      if (assistant) finalText = assistant.slice(0, FINAL_OUTPUT_MAX_LENGTH);
+      if (!promptSeen) continue;
+      const assistant = assistantRecord(kind, entry);
+      if (!assistant.text) continue;
+      partialText = assistant.text.slice(0, FINAL_OUTPUT_MAX_LENGTH);
+      if (assistant.terminal) finalText = partialText;
     } catch {
       // Ignore malformed or partially flushed trailing records.
     }
   }
-  return { userSeen, promptSeen, finalText };
+  return {
+    userSeen,
+    promptSeen,
+    matchingPromptCount,
+    partialText,
+    finalText,
+  };
+}
+
+export function definedSessionMetaPatch(
+  session: { kind: string; value: string } | undefined,
+  sessionFilePath: string | undefined,
+) {
+  return {
+    ...(session?.kind === "id"
+      ? { nativeSessionId: session.value }
+      : undefined),
+    ...(sessionFilePath !== undefined ? { sessionFilePath } : undefined),
+  } satisfies Partial<SubagentMeta>;
+}
+
+class AsyncLock {
+  private tail = Promise.resolve();
+
+  async run<A>(operation: () => Promise<A>) {
+    const previous = this.tail;
+    let release: () => void = () => {};
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
 }
 
 function makeHerdrSession(kind: BackendName, task: SpawnTask) {
@@ -469,11 +630,18 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     let runController: AbortController | undefined;
     let liveTimer: ReturnType<typeof setInterval> | undefined;
     let liveReadPending = false;
+    const lifecycleLock = new AsyncLock();
 
     const state = {
       closed: false,
       activeRun: false,
       runSerial: 0,
+      promptObserved: false,
+      queuedSteers: [] as Array<{
+        readonly text: string;
+        readonly requiredOccurrence: number;
+      }>,
+      activePrompt: task.prompt,
       activeCursor: captureSessionCursor(undefined),
       meta: {
         backend: kind,
@@ -486,7 +654,10 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       try: () => runHerdr(["pane", "layout", "--current"]),
       catch: (error) => new SpawnError({ message: boundedError(error) }),
     });
-    const direction = chooseDirection(parseJsonOutput(layout.stdout));
+    const direction = yield* Effect.try({
+      try: () => chooseDirection(parseJsonOutput(layout.stdout)),
+      catch: (error) => new SpawnError({ message: boundedError(error) }),
+    });
     paneId = yield* Effect.acquireRelease(
       Effect.tryPromise({
         try: async () => {
@@ -579,7 +750,9 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
               screen.includes("Bypass Permissions mode") &&
               screen.includes("Yes, I accept")
             ) {
-              await runHerdr(["pane", "send-keys", paneId!, "down", "enter"]);
+              await runHerdr(["pane", "send-keys", paneId!, "down"]);
+              await delay(250);
+              await runHerdr(["pane", "send-keys", paneId!, "enter"]);
               await runHerdr([
                 "agent",
                 "wait",
@@ -616,12 +789,11 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         );
         const session = agentSession(agent);
         const sessionFilePath = resolveSessionPath(kind, task, session);
-        const patch: Partial<SubagentMeta> = {
-          nativeSessionId: session?.kind === "id" ? session.value : undefined,
-          sessionFilePath,
-        };
-        state.meta = { ...state.meta, ...patch };
-        emit({ _tag: "MetaChanged", meta: patch });
+        const patch = definedSessionMetaPatch(session, sessionFilePath);
+        if (Object.keys(patch).length > 0) {
+          state.meta = { ...state.meta, ...patch };
+          emit({ _tag: "MetaChanged", meta: patch });
+        }
       } catch {
         // Session identity is best-effort; callers retry before settling.
       }
@@ -662,6 +834,54 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       }, LIVE_READ_INTERVAL_MS);
     };
 
+    const getAgentStatus = (signal?: AbortSignal) =>
+      retryHerdrMonitoring(async () => {
+        const response = await runHerdr(["agent", "get", agentName], {
+          signal,
+          timeoutMs: 3_000,
+        });
+        return nestedString(
+          parseJsonOutput(response.stdout),
+          "result",
+          "agent",
+          "agent_status",
+        );
+      }, signal);
+
+    const waitForStatus = (
+      statuses: ReadonlyArray<"idle" | "working" | "blocked" | "done">,
+      signal: AbortSignal,
+    ) =>
+      retryHerdrMonitoring(async () => {
+        const args = ["agent", "wait", agentName];
+        for (const status of statuses) args.push("--until", status);
+        const response = await runHerdr(args, { signal });
+        return nestedString(
+          parseJsonOutput(response.stdout),
+          "result",
+          "agent",
+          "agent_status",
+        );
+      }, signal);
+
+    const ensureTargetPresent = async () => {
+      if (!paneId) throw new Error("Herdr subagent pane is closed.");
+      try {
+        await Promise.all([
+          runHerdr(["pane", "get", paneId], { timeoutMs: 3_000 }),
+          runHerdr(["agent", "get", agentName], { timeoutMs: 3_000 }),
+        ]);
+      } catch (error) {
+        if (isMissingHerdrTarget(error)) {
+          state.closed = true;
+          paneId = undefined;
+          stopLiveReads();
+          Queue.endUnsafe(events);
+        }
+        throw error;
+      }
+    };
+
     const observedPrompt = async (
       prompt: string,
       cursor: ReturnType<typeof captureSessionCursor>,
@@ -669,52 +889,74 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       for (let attempt = 0; attempt < 30; attempt++) {
         await refreshMeta();
         if (
-          sessionRunSince(state.meta.sessionFilePath, cursor, prompt).userSeen
+          sessionRunSince(kind, state.meta.sessionFilePath, cursor, prompt)
+            .promptSeen
         ) {
           return true;
         }
-        const terminal = await readTerminal("recent-unwrapped", 300).catch(
-          () => undefined,
-        );
-        if (terminal?.includes(prompt)) return true;
-        const current = await runHerdr(["agent", "get", agentName], {
-          timeoutMs: 3_000,
-        }).catch(() => undefined);
-        const status = current
-          ? nestedString(
-              parseJsonOutput(current.stdout),
-              "result",
-              "agent",
-              "agent_status",
-            )
-          : undefined;
-        if (status === "working" || status === "blocked") return true;
         await delay(100);
       }
       return false;
     };
 
+    const updateSteeringQueueUnlocked = async () => {
+      if (state.queuedSteers.length === 0) return;
+      await refreshMeta();
+      const pending = state.queuedSteers.filter(
+        (queued) =>
+          sessionRunSince(
+            kind,
+            state.meta.sessionFilePath,
+            state.activeCursor,
+            queued.text,
+          ).matchingPromptCount < queued.requiredOccurrence,
+      );
+      if (pending.length === state.queuedSteers.length) return;
+      state.queuedSteers = pending;
+      emit({
+        _tag: "QueueChanged",
+        queued: pending.map(({ text }) => ({ text, kind: "steer" })),
+      });
+    };
+
+    const updateSteeringQueue = () =>
+      lifecycleLock.run(updateSteeringQueueUnlocked);
+
     const collectFinalText = async (
       cursor: ReturnType<typeof captureSessionCursor>,
+      prompt: string,
     ) => {
       for (let attempt = 0; attempt < 50; attempt++) {
         await refreshMeta();
-        const run = sessionRunSince(state.meta.sessionFilePath, cursor);
-        if (run.finalText) return run.finalText;
+        await updateSteeringQueue();
+        const run = sessionRunSince(
+          kind,
+          state.meta.sessionFilePath,
+          cursor,
+          prompt,
+        );
+        if (run.finalText && state.queuedSteers.length === 0) {
+          return run.finalText;
+        }
         await delay(Math.min(100 + attempt * 4, 300));
       }
       return "";
     };
 
-    const settle = (serial: number, outcome: RunOutcome) => {
+    const settleUnlocked = (serial: number, outcome: RunOutcome) => {
       if (state.closed || !state.activeRun || serial !== state.runSerial)
-        return;
+        return false;
       state.activeRun = false;
+      state.queuedSteers = [];
       runController = undefined;
       stopLiveReads();
       emit({ _tag: "QueueChanged", queued: [] });
       emit({ _tag: "RunSettled", outcome });
+      return true;
     };
+
+    const settle = (serial: number, outcome: RunOutcome) =>
+      lifecycleLock.run(async () => settleUnlocked(serial, outcome));
 
     const confirmNativeStopped = async () => {
       try {
@@ -739,8 +981,8 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           "agent_status",
         );
         return status === "idle" || status === "done";
-      } catch {
-        return false;
+      } catch (error) {
+        return isMissingHerdrTarget(error);
       }
     };
 
@@ -758,7 +1000,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     };
 
     const closeCurrentPane = async () => {
-      if (!paneId) return false;
+      if (!paneId) return true;
       const closingPaneId = paneId;
       try {
         await runHerdr(["pane", "close", closingPaneId], {
@@ -766,7 +1008,11 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         });
         paneId = undefined;
         return true;
-      } catch {
+      } catch (error) {
+        if (isMissingHerdrTarget(error)) {
+          paneId = undefined;
+          return true;
+        }
         return false;
       }
     };
@@ -787,20 +1033,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             signal: controller.signal,
           });
         const waitUntilSettled = () =>
-          runHerdr(
-            [
-              "agent",
-              "wait",
-              agentName,
-              "--until",
-              "idle",
-              "--until",
-              "done",
-              "--until",
-              "blocked",
-            ],
-            { signal: controller.signal },
-          );
+          waitForStatus(["idle", "done", "blocked"], controller.signal);
         const acceptClaudeWarning = async () => {
           if (kind !== "claude") return false;
           const screen = await readTerminal("visible").catch(() => undefined);
@@ -810,7 +1043,10 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           ) {
             return false;
           }
-          await runHerdr(["pane", "send-keys", paneId!, "down", "enter"]);
+          if (!paneId) return false;
+          await runHerdr(["pane", "send-keys", paneId, "down"]);
+          await delay(250);
+          await runHerdr(["pane", "send-keys", paneId, "enter"]);
           await delay(500);
           return true;
         };
@@ -851,6 +1087,13 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             );
           }
         }
+        if (
+          !controller.signal.aborted &&
+          state.activeRun &&
+          serial === state.runSerial
+        ) {
+          state.promptObserved = true;
+        }
 
         // `agent wait --until idle` can otherwise match the pre-run idle state
         // before Herdr notices the native TUI has started. First observe either
@@ -859,16 +1102,13 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         let workStarted = false;
         for (let attempt = 0; attempt < 150; attempt++) {
           await refreshMeta();
-          const run = sessionRunSince(state.meta.sessionFilePath, cursor);
-          const current = await runHerdr(["agent", "get", agentName], {
-            timeoutMs: 3_000,
-          });
-          const currentStatus = nestedString(
-            parseJsonOutput(current.stdout),
-            "result",
-            "agent",
-            "agent_status",
+          const run = sessionRunSince(
+            kind,
+            state.meta.sessionFilePath,
+            cursor,
+            prompt,
           );
+          const currentStatus = await getAgentStatus(controller.signal);
           if (currentStatus === "working" || currentStatus === "blocked") {
             workStarted = true;
             break;
@@ -892,15 +1132,9 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         // timeout, so long reviews can be reported as failed while the native
         // agent keeps working in its pane. Submission and completion are two
         // independently abortable operations instead.
-        let response: CommandResult = completedBeforeWait
-          ? await runHerdr(["agent", "get", agentName], { timeoutMs: 3_000 })
+        let status = completedBeforeWait
+          ? await getAgentStatus(controller.signal)
           : await waitUntilSettled();
-        let status = nestedString(
-          parseJsonOutput(response.stdout),
-          "result",
-          "agent",
-          "agent_status",
-        );
         let blockedSeen = false;
 
         while (true) {
@@ -912,13 +1146,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             return;
           }
           if (status === "working") {
-            response = await waitUntilSettled();
-            status = nestedString(
-              parseJsonOutput(response.stdout),
-              "result",
-              "agent",
-              "agent_status",
-            );
+            status = await waitUntilSettled();
             continue;
           }
           if (status === "blocked") {
@@ -928,24 +1156,10 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
               message:
                 "Herdr reports that the subagent is waiting for input in its pane.",
             });
-            response = await runHerdr(
-              [
-                "agent",
-                "wait",
-                agentName,
-                "--until",
-                "idle",
-                "--until",
-                "done",
-              ],
-              { signal: controller.signal },
-            );
-            status = nestedString(
-              parseJsonOutput(response.stdout),
-              "result",
-              "agent",
-              "agent_status",
-            );
+            do {
+              await delay(100);
+              status = await getAgentStatus(controller.signal);
+            } while (status === "blocked");
             continue;
           }
           if (status !== "idle" && status !== "done") {
@@ -954,15 +1168,32 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             );
           }
 
-          const finalText = await collectFinalText(cursor);
+          const finalText = await collectFinalText(cursor, prompt);
           if (finalText) {
-            emit({
-              _tag: "AssistantMessage",
-              parts: [{ type: "text", text: finalText }],
+            const settled = await lifecycleLock.run(async () => {
+              if (
+                controller.signal.aborted ||
+                !state.activeRun ||
+                serial !== state.runSerial ||
+                state.queuedSteers.length > 0
+              ) {
+                return false;
+              }
+              emit({
+                _tag: "AssistantMessage",
+                parts: [{ type: "text", text: finalText }],
+              });
+              return settleUnlocked(serial, {
+                _tag: "Completed",
+                finalText,
+              });
             });
-            settle(serial, { _tag: "Completed", finalText });
-            return;
+            if (settled) return;
+            status = await getAgentStatus(controller.signal);
+            continue;
           }
+          status = await getAgentStatus(controller.signal);
+          if (status === "working" || status === "blocked") continue;
           if (!blockedSeen || status === "done") {
             throw new Error(
               "Herdr agent became idle without a correlated final response.",
@@ -973,25 +1204,9 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           // response while waiting for parent feedback. Keep the managed run
           // alive until the next work/blocked transition instead of treating
           // this input boundary as completion.
-          response = await runHerdr(
-            [
-              "agent",
-              "wait",
-              agentName,
-              "--until",
-              "working",
-              "--until",
-              "blocked",
-              "--until",
-              "done",
-            ],
-            { signal: controller.signal },
-          );
-          status = nestedString(
-            parseJsonOutput(response.stdout),
-            "result",
-            "agent",
-            "agent_status",
+          status = await waitForStatus(
+            ["working", "blocked", "done"],
+            controller.signal,
           );
         }
       } catch (error) {
@@ -1017,8 +1232,9 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         }
         await refreshMeta();
         const partialText =
-          sessionRunSince(state.meta.sessionFilePath, cursor).finalText ?? "";
-        settle(serial, {
+          sessionRunSince(kind, state.meta.sessionFilePath, cursor, prompt)
+            .partialText ?? "";
+        await settle(serial, {
           _tag: "Failed",
           errorText: boundedError(error),
           partialText: partialText || undefined,
@@ -1034,6 +1250,9 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     const startRun = (prompt: string) => {
       const serial = ++state.runSerial;
       state.activeRun = true;
+      state.promptObserved = false;
+      state.queuedSteers = [];
+      state.activePrompt = prompt;
       state.activeCursor = captureSessionCursor(state.meta.sessionFilePath);
       runController = new AbortController();
       emit({ _tag: "UserMessage", text: prompt });
@@ -1054,38 +1273,159 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           try: async () => {
             if (state.closed) throw new Error("Subagent session is closed.");
             if (!state.activeRun) {
-              startRun(text);
+              await lifecycleLock.run(async () => {
+                if (state.closed) {
+                  throw new Error("Subagent session is closed.");
+                }
+                if (state.activeRun) {
+                  throw new Error(
+                    "Subagent run changed while preparing the follow-up.",
+                  );
+                }
+                await ensureTargetPresent();
+                startRun(text);
+              });
               return;
             }
-            await runHerdr(["agent", "prompt", agentName, text]);
-            emit({ _tag: "UserMessage", text });
-            emit({ _tag: "QueueChanged", queued: [{ text, kind: "steer" }] });
+
+            const serial = state.runSerial;
+            const controller = runController;
+            if (!controller) throw new Error("Subagent run is stopping.");
+            await lifecycleLock.run(async () => {
+              if (
+                state.closed ||
+                !state.activeRun ||
+                state.runSerial !== serial ||
+                controller.signal.aborted
+              ) {
+                throw new Error("Subagent run is no longer active.");
+              }
+              for (
+                let attempt = 0;
+                !state.promptObserved && attempt < 30;
+                attempt++
+              ) {
+                if (controller.signal.aborted) {
+                  throw new Error("Subagent run is stopping.");
+                }
+                await delay(100);
+              }
+              if (!state.promptObserved) {
+                throw new Error(
+                  "Cannot steer before the managed prompt is recorded.",
+                );
+              }
+              for (
+                let attempt = 0;
+                !state.meta.sessionFilePath && attempt < 30;
+                attempt++
+              ) {
+                await refreshMeta();
+                if (!state.meta.sessionFilePath) await delay(100);
+              }
+              if (!state.meta.sessionFilePath) {
+                throw new Error(
+                  "Cannot steer before the native transcript is available.",
+                );
+              }
+              const observedOccurrences = sessionRunSince(
+                kind,
+                state.meta.sessionFilePath,
+                state.activeCursor,
+                text,
+              ).matchingPromptCount;
+              const requiredOccurrence =
+                Math.max(
+                  observedOccurrences,
+                  ...state.queuedSteers
+                    .filter((queued) => queued.text === text)
+                    .map((queued) => queued.requiredOccurrence),
+                ) + 1;
+              await runHerdr(["agent", "prompt", agentName, text], {
+                signal: controller.signal,
+              });
+              if (
+                state.closed ||
+                !state.activeRun ||
+                state.runSerial !== serial ||
+                controller.signal.aborted
+              ) {
+                throw new Error("Subagent run ended while steering.");
+              }
+              state.queuedSteers.push({ text, requiredOccurrence });
+              emit({ _tag: "UserMessage", text });
+              emit({
+                _tag: "QueueChanged",
+                queued: state.queuedSteers.map((queued) => ({
+                  text: queued.text,
+                  kind: "steer",
+                })),
+              });
+              await updateSteeringQueueUnlocked();
+            });
           },
           catch: (error) => new SendError({ message: boundedError(error) }),
         }),
-      interrupt: Effect.promise(async () => {
+      interrupt: Effect.promise(async (effectSignal) => {
         if (state.closed || !state.activeRun) return;
         const serial = state.runSerial;
         runController?.abort();
-        const stopped = await stopNativeRun();
-        const closed = !stopped && (await closeCurrentPane());
-        if (!stopped && !closed) {
-          throw new Error(
-            "Herdr could not confirm interruption or close the native agent pane.",
-          );
+
+        let interrupted = false;
+        try {
+          interrupted = await lifecycleLock.run(async () => {
+            if (
+              state.closed ||
+              !state.activeRun ||
+              state.runSerial !== serial
+            ) {
+              return true;
+            }
+            const stopped = await stopNativeRun();
+            const closed = !stopped && (await closeCurrentPane());
+            if (!stopped && !closed) {
+              emit({
+                _tag: "BackendError",
+                message:
+                  "Herdr could not confirm interruption or close the native agent pane; force-disposal is pending.",
+              });
+              return false;
+            }
+            await refreshMeta();
+            const partialText =
+              sessionRunSince(
+                kind,
+                state.meta.sessionFilePath,
+                state.activeCursor,
+                state.activePrompt,
+              ).partialText ?? "";
+            settleUnlocked(serial, {
+              _tag: "Interrupted",
+              partialText: partialText || undefined,
+            });
+            if (closed) {
+              state.closed = true;
+              stopLiveReads();
+              Queue.endUnsafe(events);
+            }
+            return true;
+          });
+        } catch (error) {
+          emit({
+            _tag: "BackendError",
+            message: `Herdr interruption failed; force-disposal is pending: ${boundedError(error)}`,
+          });
         }
-        await refreshMeta();
-        const partialText =
-          sessionRunSince(state.meta.sessionFilePath, state.activeCursor)
-            .finalText ?? "";
-        settle(serial, {
-          _tag: "Interrupted",
-          partialText: partialText || undefined,
-        });
-        if (closed) {
-          state.closed = true;
-          stopLiveReads();
-          Queue.endUnsafe(events);
+
+        if (!interrupted && !effectSignal.aborted) {
+          await new Promise<void>((resolve) => {
+            if (effectSignal.aborted) resolve();
+            else {
+              effectSignal.addEventListener("abort", () => resolve(), {
+                once: true,
+              });
+            }
+          });
         }
       }),
     } satisfies SubagentSession;

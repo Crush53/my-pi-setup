@@ -15,6 +15,10 @@ import {
   agentArguments,
   captureSessionCursor,
   claudeSessionPath,
+  definedSessionMetaPatch,
+  isMissingHerdrTarget,
+  normalizedEffortForClaude,
+  retryHerdrMonitoring,
   sessionRunSince,
 } from "./src/backends/herdr.ts";
 import type { SpawnTask } from "./src/domain.ts";
@@ -75,6 +79,12 @@ test("interactive harness arguments preserve orchestration and effort boundaries
     ]);
   }
   assert.ok(trustedCodex.includes('model_reasoning_effort="xhigh"'));
+  assert.deepEqual(
+    (["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const).map(
+      normalizedEffortForClaude,
+    ),
+    ["low", "low", "low", "medium", "high", "xhigh", "max"],
+  );
 });
 
 test("Claude transcript paths use its canonical non-alphanumeric encoding", () => {
@@ -91,8 +101,15 @@ test("session cursors isolate repeated and transformed prompts to the new turn",
   const directory = mkdtempSync(join(tmpdir(), "herdr-session-test-"));
   const transcript = join(directory, "session.jsonl");
   const oldRecords = [
-    { message: { role: "user", content: "repeat prompt" } },
-    { message: { role: "assistant", content: "old answer" } },
+    { type: "message", message: { role: "user", content: "repeat prompt" } },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: "old answer",
+        stopReason: "stop",
+      },
+    },
   ];
   writeFileSync(
     transcript,
@@ -102,39 +119,291 @@ test("session cursors isolate repeated and transformed prompts to the new turn",
 
   try {
     assert.equal(
-      sessionRunSince(transcript, cursor, "repeat prompt").userSeen,
+      sessionRunSince("pi", transcript, cursor, "repeat prompt").userSeen,
       false,
     );
     const newRecords = [
-      { message: { role: "user", content: "repeat prompt" } },
-      { message: { role: "assistant", content: "new answer" } },
+      { type: "message", message: { role: "user", content: "repeat prompt" } },
+      {
+        type: "message",
+        message: {
+          role: "assistant",
+          content: "new answer",
+          stopReason: "stop",
+        },
+      },
     ];
     appendFileSync(
       transcript,
       `${newRecords.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     );
-    assert.deepEqual(sessionRunSince(transcript, cursor, "repeat prompt"), {
-      userSeen: true,
-      promptSeen: true,
-      finalText: "new answer",
-    });
+    assert.deepEqual(
+      sessionRunSince("pi", transcript, cursor, "repeat prompt"),
+      {
+        userSeen: true,
+        promptSeen: true,
+        matchingPromptCount: 1,
+        partialText: "new answer",
+        finalText: "new answer",
+      },
+    );
+
+    appendFileSync(
+      transcript,
+      `${JSON.stringify({ type: "message", message: { role: "user", content: "repeat prompt" } })}\n`,
+    );
+    const repeated = sessionRunSince("pi", transcript, cursor, "repeat prompt");
+    assert.equal(repeated.matchingPromptCount, 2);
+    assert.equal(repeated.finalText, undefined);
 
     const transformedCursor = captureSessionCursor(transcript);
     appendFileSync(
       transcript,
-      `${JSON.stringify({ message: { role: "user", content: "generated review prompt" } })}\n`,
+      `${JSON.stringify({ type: "user", message: { role: "user", content: "<command-name>/review</command-name>\n<command-message>review</command-message>\n<command-args></command-args>" } })}\n`,
     );
     assert.deepEqual(
-      sessionRunSince(transcript, transformedCursor, "/review"),
+      sessionRunSince("claude", transcript, transformedCursor, "/review"),
       {
         userSeen: true,
-        promptSeen: false,
+        promptSeen: true,
+        matchingPromptCount: 1,
+        partialText: undefined,
         finalText: undefined,
       },
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("native transcripts require harness-specific terminal answers", () => {
+  const directory = mkdtempSync(join(tmpdir(), "herdr-terminal-test-"));
+  try {
+    const claude = join(directory, "claude.jsonl");
+    writeFileSync(
+      claude,
+      [
+        { type: "user", message: { role: "user", content: "managed" } },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "interim" }],
+            stop_reason: "tool_use",
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    const claudeRun = sessionRunSince(
+      "claude",
+      claude,
+      { sessionFilePath: claude, offset: 0 },
+      "managed",
+    );
+    assert.equal(claudeRun.partialText, "interim");
+    assert.equal(claudeRun.finalText, undefined);
+    appendFileSync(
+      claude,
+      `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "final" }], stop_reason: "end_turn" } })}\n`,
+    );
+    assert.equal(
+      sessionRunSince(
+        "claude",
+        claude,
+        { sessionFilePath: claude, offset: 0 },
+        "managed",
+      ).finalText,
+      "final",
+    );
+
+    const codex = join(directory, "codex.jsonl");
+    writeFileSync(
+      codex,
+      [
+        {
+          type: "event_msg",
+          payload: { type: "user_message", message: "startup activity" },
+        },
+        {
+          type: "event_msg",
+          payload: {
+            type: "agent_message",
+            message: "startup commentary",
+            phase: "commentary",
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    assert.deepEqual(
+      sessionRunSince(
+        "codex",
+        codex,
+        { sessionFilePath: codex, offset: 0 },
+        "$review-agent inspect",
+      ),
+      {
+        userSeen: true,
+        promptSeen: false,
+        matchingPromptCount: 0,
+        partialText: undefined,
+        finalText: undefined,
+      },
+    );
+    appendFileSync(
+      codex,
+      [
+        {
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "$review-agent inspect",
+          },
+        },
+        {
+          type: "event_msg",
+          payload: {
+            type: "agent_message",
+            message: "working note",
+            phase: "commentary",
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    let codexRun = sessionRunSince(
+      "codex",
+      codex,
+      { sessionFilePath: codex, offset: 0 },
+      "$review-agent inspect",
+    );
+    assert.equal(codexRun.partialText, "working note");
+    assert.equal(codexRun.finalText, undefined);
+    appendFileSync(
+      codex,
+      `${JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message: "review complete", phase: "final_answer" } })}\n`,
+    );
+    codexRun = sessionRunSince(
+      "codex",
+      codex,
+      { sessionFilePath: codex, offset: 0 },
+      "$review-agent inspect",
+    );
+    assert.equal(codexRun.finalText, "review complete");
+    appendFileSync(
+      codex,
+      [
+        {
+          type: "event_msg",
+          payload: { type: "user_message", message: "steer again" },
+        },
+        {
+          type: "event_msg",
+          payload: {
+            type: "agent_message",
+            message: "second-turn commentary",
+            phase: "commentary",
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    codexRun = sessionRunSince(
+      "codex",
+      codex,
+      { sessionFilePath: codex, offset: 0 },
+      "$review-agent inspect",
+    );
+    assert.equal(codexRun.partialText, "second-turn commentary");
+    assert.equal(codexRun.finalText, undefined);
+
+    const pi = join(directory, "pi.jsonl");
+    writeFileSync(
+      pi,
+      [
+        { type: "message", message: { role: "user", content: "managed" } },
+        {
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "calling a tool" }],
+            stopReason: "toolUse",
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    assert.equal(
+      sessionRunSince("pi", pi, { sessionFilePath: pi, offset: 0 }, "managed")
+        .finalText,
+      undefined,
+    );
+    appendFileSync(
+      pi,
+      `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "pi complete" }], stopReason: "stop" } })}\n`,
+    );
+    assert.equal(
+      sessionRunSince("pi", pi, { sessionFilePath: pi, offset: 0 }, "managed")
+        .finalText,
+      "pi complete",
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("session metadata refreshes never erase known values", () => {
+  assert.deepEqual(definedSessionMetaPatch(undefined, undefined), {});
+  assert.deepEqual(
+    definedSessionMetaPatch({ kind: "id", value: "native-id" }, undefined),
+    { nativeSessionId: "native-id" },
+  );
+  assert.deepEqual(
+    definedSessionMetaPatch(
+      { kind: "path", value: "/session.jsonl" },
+      "/session.jsonl",
+    ),
+    { sessionFilePath: "/session.jsonl" },
+  );
+});
+
+test("missing Herdr agents and panes are recognized as closed", () => {
+  assert.equal(
+    isMissingHerdrTarget(new Error('{"error":{"code":"agent_not_found"}}')),
+    true,
+  );
+  assert.equal(
+    isMissingHerdrTarget(new Error('{"error":{"code":"pane_not_found"}}')),
+    true,
+  );
+  assert.equal(isMissingHerdrTarget(new Error("temporary failure")), false);
+});
+
+test("monitoring retries transient failures but not missing agents", async () => {
+  let attempts = 0;
+  const result = await retryHerdrMonitoring(async () => {
+    attempts++;
+    if (attempts < 3) throw new Error("temporary command failure");
+    return "healthy";
+  });
+  assert.equal(result, "healthy");
+  assert.equal(attempts, 3);
+
+  attempts = 0;
+  await assert.rejects(
+    retryHerdrMonitoring(async () => {
+      attempts++;
+      throw new Error('{"error":{"code":"agent_not_found"}}');
+    }),
+    /agent_not_found/,
+  );
+  assert.equal(attempts, 1);
 });
 
 test("node test workers do not inherit the Herdr interactive backend", () => {

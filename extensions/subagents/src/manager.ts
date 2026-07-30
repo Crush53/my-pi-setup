@@ -11,16 +11,7 @@
  * and issue fire-and-forget commands without touching the Effect runtime.
  */
 
-import {
-  Context,
-  Effect,
-  Exit,
-  Fiber,
-  Layer,
-  Result,
-  Scope,
-  Stream,
-} from "effect";
+import { Context, Effect, Exit, Fiber, Layer, Scope, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "./backend.ts";
 import { BackendRegistry } from "./backend.ts";
 import type {
@@ -565,16 +556,16 @@ const makeManager = Effect.gen(function* () {
       if (entry.snapshot.status !== "running") return;
       const graceful = yield* entry.session.interrupt.pipe(
         Effect.timeout(STOP_TIMEOUT_MS),
-        Effect.result,
+        Effect.exit,
       );
-      if (Result.isFailure(graceful)) {
+      if (Exit.isFailure(graceful)) {
         // Settle before closing the scope so the pump's stream-ended
         // fallback ("Backend event stream ended unexpectedly") cannot win
         // the race and report the wrong terminal reason.
         yield* Effect.sync(() => {
           settle(entry, { _tag: "Interrupted" });
           entry.snapshot.errorText =
-            "Abort deadline exceeded; session was force-disposed";
+            "Abort failed or exceeded its deadline; session was force-disposed";
           notify(entry.snapshot.id);
         });
         // Bound the close like disposeAll does: a stuck backend finalizer
