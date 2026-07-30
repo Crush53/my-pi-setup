@@ -141,7 +141,7 @@ function protocolError(value: unknown) {
 }
 
 /** 0.144.3 accepts these effort slugs; individual models expose a subset. */
-function preferredCodexEffort(effort: ReasoningEffort | undefined) {
+export function preferredCodexEffort(effort: ReasoningEffort | undefined) {
   switch (effort) {
     case "off":
     case "minimal":

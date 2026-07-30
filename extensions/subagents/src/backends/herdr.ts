@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
+import { preferredCodexEffort } from "./codex.ts";
 import { resolvePiModel } from "./pi.ts";
 import type {
   BackendName,
@@ -19,7 +20,7 @@ import { SendError, SpawnError } from "../domain.ts";
 
 const COMMAND_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
 const LIVE_READ_INTERVAL_MS = 500;
-const INTERRUPT_TIMEOUT_MS = 5_000;
+const INTERRUPT_STAGE_TIMEOUT_MS = 750;
 const FINAL_OUTPUT_MAX_LENGTH = 1024 * 1024;
 const CHILD_EXCLUDED_TOOLS = [
   "subagent_spawn",
@@ -191,12 +192,6 @@ function normalizedEffortForClaude(effort: ReasoningEffort | undefined) {
   return effort;
 }
 
-function normalizedEffortForCodex(effort: ReasoningEffort | undefined) {
-  if (effort === "off") return "none";
-  if (effort === "minimal") return "low";
-  return effort;
-}
-
 function modelLabel(
   kind: BackendName,
   task: SpawnTask,
@@ -231,9 +226,8 @@ export function agentArguments(
       `subagent: ${task.title}`,
       "--dangerously-skip-permissions",
       "--disallowed-tools",
-      "Agent,Task",
+      "Agent,Task,Workflow",
     ];
-    if (!task.parent.projectTrusted) args.push("--setting-sources", "user");
     if (task.model) args.push("--model", task.model);
     const effort = normalizedEffortForClaude(task.reasoningEffort);
     if (effort) args.push("--effort", effort);
@@ -247,7 +241,7 @@ export function agentArguments(
   ];
   if (task.parent.projectTrusted) args.push("--dangerously-bypass-hook-trust");
   if (task.model) args.push("--model", task.model);
-  const effort = normalizedEffortForCodex(task.reasoningEffort);
+  const effort = preferredCodexEffort(task.reasoningEffort);
   if (effort) args.push("--config", `model_reasoning_effort=\"${effort}\"`);
   return args;
 }
@@ -259,8 +253,14 @@ function agentSession(agent: JsonRecord | undefined) {
   return kind && value ? { kind, value } : undefined;
 }
 
-function claudeSessionPath(cwd: string, sessionId: string) {
-  const projectDirectory = cwd.replace(/[/.]/g, "-");
+export function claudeSessionPath(cwd: string, sessionId: string) {
+  let canonicalCwd = cwd;
+  try {
+    canonicalCwd = fs.realpathSync(cwd);
+  } catch {
+    // Claude receives the original cwd when it cannot be canonicalized.
+  }
+  const projectDirectory = canonicalCwd.replace(/[^a-zA-Z0-9]/g, "-");
   return path.join(
     process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
     "projects",
@@ -373,20 +373,36 @@ function assistantText(entry: JsonRecord) {
   return undefined;
 }
 
-export function sessionRun(
+export function captureSessionCursor(sessionFilePath: string | undefined) {
+  if (!sessionFilePath) return { sessionFilePath, offset: 0 };
+  try {
+    return { sessionFilePath, offset: fs.statSync(sessionFilePath).size };
+  } catch {
+    return { sessionFilePath, offset: 0 };
+  }
+}
+
+export function sessionRunSince(
   sessionFilePath: string | undefined,
-  prompt: string,
-): { promptSeen: boolean; finalText?: string } {
+  cursor: ReturnType<typeof captureSessionCursor>,
+  expectedPrompt?: string,
+) {
   if (!sessionFilePath || !fs.existsSync(sessionFilePath)) {
-    return { promptSeen: false };
+    return { userSeen: false, promptSeen: false };
   }
   let contents: string;
   try {
-    contents = fs.readFileSync(sessionFilePath, "utf8");
+    const bytes = fs.readFileSync(sessionFilePath);
+    const offset =
+      cursor.sessionFilePath === sessionFilePath
+        ? Math.min(cursor.offset, bytes.length)
+        : 0;
+    contents = bytes.subarray(offset).toString("utf8");
   } catch {
-    return { promptSeen: false };
+    return { userSeen: false, promptSeen: false };
   }
 
+  let userSeen = false;
   let promptSeen = false;
   let finalText: string | undefined;
   for (const rawLine of contents.split("\n")) {
@@ -395,19 +411,20 @@ export function sessionRun(
     try {
       const entry = JSON.parse(line) as JsonRecord;
       const user = userText(entry);
-      if (user?.trim() === prompt.trim()) {
-        promptSeen = true;
+      if (user) {
+        userSeen = true;
+        promptSeen ||= user.trim() === expectedPrompt?.trim();
         finalText = undefined;
         continue;
       }
-      if (!promptSeen) continue;
+      if (!userSeen) continue;
       const assistant = assistantText(entry);
       if (assistant) finalText = assistant.slice(0, FINAL_OUTPUT_MAX_LENGTH);
     } catch {
       // Ignore malformed or partially flushed trailing records.
     }
   }
-  return { promptSeen, finalText };
+  return { userSeen, promptSeen, finalText };
 }
 
 function makeHerdrSession(kind: BackendName, task: SpawnTask) {
@@ -457,7 +474,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       closed: false,
       activeRun: false,
       runSerial: 0,
-      activePrompt: task.prompt,
+      activeCursor: captureSessionCursor(undefined),
       meta: {
         backend: kind,
         modelLabel: modelLabel(kind, task, resolvedPiModel),
@@ -606,7 +623,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         state.meta = { ...state.meta, ...patch };
         emit({ _tag: "MetaChanged", meta: patch });
       } catch {
-        // Session identity is best-effort; terminal output remains the fallback.
+        // Session identity is best-effort; callers retry before settling.
       }
     };
 
@@ -645,32 +662,48 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       }, LIVE_READ_INTERVAL_MS);
     };
 
-    const observedPrompt = async (prompt: string) => {
+    const observedPrompt = async (
+      prompt: string,
+      cursor: ReturnType<typeof captureSessionCursor>,
+    ) => {
       for (let attempt = 0; attempt < 30; attempt++) {
         await refreshMeta();
-        if (sessionRun(state.meta.sessionFilePath, prompt).promptSeen)
+        if (
+          sessionRunSince(state.meta.sessionFilePath, cursor, prompt).userSeen
+        ) {
           return true;
+        }
         const terminal = await readTerminal("recent-unwrapped", 300).catch(
           () => undefined,
         );
         if (terminal?.includes(prompt)) return true;
+        const current = await runHerdr(["agent", "get", agentName], {
+          timeoutMs: 3_000,
+        }).catch(() => undefined);
+        const status = current
+          ? nestedString(
+              parseJsonOutput(current.stdout),
+              "result",
+              "agent",
+              "agent_status",
+            )
+          : undefined;
+        if (status === "working" || status === "blocked") return true;
         await delay(100);
       }
       return false;
     };
 
-    const collectFinalText = async (prompt: string) => {
-      await refreshMeta();
-      for (let attempt = 0; attempt < 12; attempt++) {
-        const run = sessionRun(state.meta.sessionFilePath, prompt);
+    const collectFinalText = async (
+      cursor: ReturnType<typeof captureSessionCursor>,
+    ) => {
+      for (let attempt = 0; attempt < 30; attempt++) {
+        await refreshMeta();
+        const run = sessionRunSince(state.meta.sessionFilePath, cursor);
         if (run.finalText) return run.finalText;
         await delay(100);
-        await refreshMeta();
       }
-      return (
-        (await readTerminal("recent-unwrapped", 200).catch(() => undefined)) ??
-        ""
-      );
+      return "";
     };
 
     const settle = (serial: number, outcome: RunOutcome) => {
@@ -683,12 +716,72 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       emit({ _tag: "RunSettled", outcome });
     };
 
+    const confirmNativeStopped = async () => {
+      try {
+        const result = await runHerdr(
+          [
+            "agent",
+            "wait",
+            agentName,
+            "--until",
+            "idle",
+            "--until",
+            "done",
+            "--timeout",
+            String(INTERRUPT_STAGE_TIMEOUT_MS),
+          ],
+          { timeoutMs: INTERRUPT_STAGE_TIMEOUT_MS + 200 },
+        );
+        const status = nestedString(
+          parseJsonOutput(result.stdout),
+          "result",
+          "agent",
+          "agent_status",
+        );
+        return status === "idle" || status === "done";
+      } catch {
+        return false;
+      }
+    };
+
+    const stopNativeRun = async () => {
+      await runHerdr(["agent", "send-keys", agentName, "esc"], {
+        timeoutMs: 500,
+      }).catch(() => undefined);
+      if (await confirmNativeStopped()) return true;
+      if (paneId) {
+        await runHerdr(["pane", "send-keys", paneId, "ctrl+c"], {
+          timeoutMs: 500,
+        }).catch(() => undefined);
+      }
+      return confirmNativeStopped();
+    };
+
+    const closeCurrentPane = async () => {
+      if (!paneId) return false;
+      const closingPaneId = paneId;
+      try {
+        await runHerdr(["pane", "close", closingPaneId], {
+          timeoutMs: 1_000,
+        });
+        paneId = undefined;
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
     const waitForRun = async (
       serial: number,
       prompt: string,
       controller: AbortController,
     ) => {
+      let cursor = state.activeCursor;
       try {
+        await refreshMeta();
+        cursor = captureSessionCursor(state.meta.sessionFilePath);
+        state.activeCursor = cursor;
+
         const submitPrompt = () =>
           runHerdr(["agent", "prompt", agentName, prompt], {
             signal: controller.signal,
@@ -746,13 +839,13 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         }
         if (await acceptClaudeWarning()) await submitPrompt();
 
-        if (!(await observedPrompt(prompt))) {
+        if (!(await observedPrompt(prompt, cursor))) {
           // A still-initializing TUI can consume the submitted bytes without
           // creating a user turn. Give startup one more grace period and retry
           // once, then fail instead of returning the startup screen as success.
           await delay(2_000);
           await submitPrompt();
-          if (!(await observedPrompt(prompt))) {
+          if (!(await observedPrompt(prompt, cursor))) {
             throw new Error(
               "Herdr submitted the prompt, but the native agent did not record it.",
             );
@@ -766,10 +859,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         let workStarted = false;
         for (let attempt = 0; attempt < 150; attempt++) {
           await refreshMeta();
-          if (sessionRun(state.meta.sessionFilePath, prompt).finalText) {
-            completedBeforeWait = true;
-            break;
-          }
+          const run = sessionRunSince(state.meta.sessionFilePath, cursor);
           const current = await runHerdr(["agent", "get", agentName], {
             timeoutMs: 3_000,
           });
@@ -781,6 +871,13 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           );
           if (currentStatus === "working" || currentStatus === "blocked") {
             workStarted = true;
+            break;
+          }
+          if (
+            run.finalText &&
+            (currentStatus === "idle" || currentStatus === "done")
+          ) {
+            completedBeforeWait = true;
             break;
           }
           await delay(100);
@@ -804,6 +901,15 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           "agent",
           "agent_status",
         );
+        if (status === "working") {
+          response = await waitUntilSettled();
+          status = nestedString(
+            parseJsonOutput(response.stdout),
+            "result",
+            "agent",
+            "agent_status",
+          );
+        }
         if (status === "blocked") {
           emit({
             _tag: "BackendError",
@@ -827,22 +933,21 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           serial !== state.runSerial
         )
           return;
-        const correlatedFinal = sessionRun(
-          state.meta.sessionFilePath,
-          prompt,
-        ).finalText;
-        if (status !== "idle" && !(status === "done" && correlatedFinal)) {
+        if (status !== "idle" && status !== "done") {
           throw new Error(
             `Herdr agent ended in unexpected status ${status ?? "unknown"}.`,
           );
         }
-        const finalText = await collectFinalText(prompt);
-        if (finalText) {
-          emit({
-            _tag: "AssistantMessage",
-            parts: [{ type: "text", text: finalText }],
-          });
+        const finalText = await collectFinalText(cursor);
+        if (!finalText) {
+          throw new Error(
+            "Herdr agent became idle without a correlated final response.",
+          );
         }
+        emit({
+          _tag: "AssistantMessage",
+          parts: [{ type: "text", text: finalText }],
+        });
         settle(serial, { _tag: "Completed", finalText });
       } catch (error) {
         if (
@@ -851,23 +956,29 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           serial !== state.runSerial
         )
           return;
-        const promptWasSeen = await observedPrompt(prompt).catch(() => false);
-        const partialText = await collectFinalText(prompt).catch(() => "");
+        const promptWasSeen = await observedPrompt(prompt, cursor).catch(
+          () => false,
+        );
+        const stopped = !promptWasSeen || (await stopNativeRun());
+        const shouldClose = !promptWasSeen || !stopped;
+        const closed = shouldClose ? await closeCurrentPane() : false;
+        if (shouldClose && !closed) {
+          emit({
+            _tag: "BackendError",
+            message:
+              "Herdr monitoring failed and the native agent could not be stopped or closed; keeping it tracked as running.",
+          });
+          return;
+        }
+        await refreshMeta();
+        const partialText =
+          sessionRunSince(state.meta.sessionFilePath, cursor).finalText ?? "";
         settle(serial, {
           _tag: "Failed",
           errorText: boundedError(error),
           partialText: partialText || undefined,
         });
-
-        // A first-turn submission failure has no useful live session to keep.
-        // Close it immediately so the failed manager entry cannot leave an
-        // idle, unmanaged pane behind.
-        if (!promptWasSeen && paneId) {
-          const failedPaneId = paneId;
-          paneId = undefined;
-          await runHerdr(["pane", "close", failedPaneId], {
-            timeoutMs: 3_000,
-          }).catch(() => undefined);
+        if (closed) {
           state.closed = true;
           stopLiveReads();
           Queue.endUnsafe(events);
@@ -878,7 +989,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     const startRun = (prompt: string) => {
       const serial = ++state.runSerial;
       state.activeRun = true;
-      state.activePrompt = prompt;
+      state.activeCursor = captureSessionCursor(state.meta.sessionFilePath);
       runController = new AbortController();
       emit({ _tag: "UserMessage", text: prompt });
       emit({ _tag: "RunStarted" });
@@ -911,60 +1022,22 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         if (state.closed || !state.activeRun) return;
         const serial = state.runSerial;
         runController?.abort();
-
-        const confirmStopped = async () => {
-          try {
-            const result = await runHerdr(
-              [
-                "agent",
-                "wait",
-                agentName,
-                "--until",
-                "idle",
-                "--until",
-                "done",
-                "--timeout",
-                String(INTERRUPT_TIMEOUT_MS),
-              ],
-              { timeoutMs: INTERRUPT_TIMEOUT_MS + 1_000 },
-            );
-            const status = nestedString(
-              parseJsonOutput(result.stdout),
-              "result",
-              "agent",
-              "agent_status",
-            );
-            return status === "idle" || status === "done";
-          } catch {
-            return false;
-          }
-        };
-
-        await runHerdr(["agent", "send-keys", agentName, "esc"], {
-          timeoutMs: 3_000,
-        }).catch(() => undefined);
-        let stopped = await confirmStopped();
-        if (!stopped && paneId) {
-          await runHerdr(["pane", "send-keys", paneId, "ctrl+c"], {
-            timeoutMs: 3_000,
-          }).catch(() => undefined);
-          stopped = await confirmStopped();
+        const stopped = await stopNativeRun();
+        const closed = !stopped && (await closeCurrentPane());
+        if (!stopped && !closed) {
+          throw new Error(
+            "Herdr could not confirm interruption or close the native agent pane.",
+          );
         }
-
-        const partialText = await collectFinalText(state.activePrompt).catch(
-          () => "",
-        );
+        await refreshMeta();
+        const partialText =
+          sessionRunSince(state.meta.sessionFilePath, state.activeCursor)
+            .finalText ?? "";
         settle(serial, {
           _tag: "Interrupted",
           partialText: partialText || undefined,
         });
-
-        if (!stopped && paneId) {
-          const unresponsivePaneId = paneId;
-          paneId = undefined;
-          await runHerdr(["pane", "close", unresponsivePaneId], {
-            timeoutMs: 3_000,
-          }).catch(() => undefined);
+        if (closed) {
           state.closed = true;
           stopLiveReads();
           Queue.endUnsafe(events);

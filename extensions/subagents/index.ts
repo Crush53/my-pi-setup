@@ -146,6 +146,9 @@ export function resolveChildProjectTrust(options: {
   if (path.resolve(options.childCwd) === path.resolve(options.parentCwd)) {
     return options.parentTrusted;
   }
+  // An untrusted parent must not escape into any trusted directory and launch
+  // a permission-bypassing child there.
+  if (!options.parentTrusted) return false;
   if (isWithin(options.childCwd, getAgentDir())) return true;
   try {
     const trustStore = new ProjectTrustStore(getAgentDir());

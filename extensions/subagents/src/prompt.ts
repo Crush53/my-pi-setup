@@ -16,6 +16,9 @@ export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "For native code-review skills, ask Claude Code to use /review, but start a Codex review prompt with $review-agent; Codex /review is an interactive TUI command, not its installed review skill.",
   "When running inside Herdr, subagent_spawn creates a visible sibling pane for auditing. Input typed directly into a settled child pane is outside Pi's manager and is not collected or delivered; use the managed /subagents controls for follow-up turns.",
   "After subagent_spawn, keep working; results arrive automatically. Only call subagent_wait when you cannot proceed without the result.",
+  "When a Herdr child is blocked on a native TUI question, inspect its pane and answer autonomously from the task context using herdr pane send-keys/send-text; ask the user only for genuinely user-only preferences, missing requirements, credentials, or destructive authorization.",
+  "For planning delegations, iterate with the child: answer questions, challenge assumptions, compare alternatives, and request revisions until the plan is implementation-ready rather than accepting the first draft.",
+  "When a Herdr child settles, keep its pane open if it is blocked, asking a question, or needs follow-up. Once its result is captured and no follow-up is needed, close the pane with herdr pane close <pane-id>; do not leave completed audit panes open indefinitely.",
 ];
 
 /** Model-facing schema descriptions for subagent_spawn task and execution options. */

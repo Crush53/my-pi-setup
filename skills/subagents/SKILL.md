@@ -78,3 +78,23 @@ Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, 
 - `/subagents`: inspect or take over a run interactively.
 
 Results return automatically. After spawning, continue useful parent work instead of immediately waiting.
+
+## Interactive Questions and Planning
+
+A native child can enter Herdr's `blocked` state for permission prompts, planning questions, or numbered/custom-choice dialogs. `blocked` is not completion.
+
+1. Keep the manager entry and Herdr pane open.
+2. Read the latest pane snapshot to capture the exact question and options.
+3. The parent agent should answer autonomously from the task, repository, and conversation context. Do not bounce routine planning or implementation decisions back to the user merely because a child asked them.
+4. Ask the user only when the answer requires genuinely user-only information: a personal preference, missing requirement, credential, or authorization for a destructive or irreversible action.
+5. Relay menu navigation with `herdr pane send-keys <pane-id> …`; relay a custom answer with `herdr pane send-text <pane-id> <text>` followed by `herdr pane send-keys <pane-id> enter`.
+6. Wait for the child to return to `working`, and repeat if it becomes `blocked` with another question.
+7. Cancel only when explicitly requested or when the child cannot make progress.
+
+Do not guess option numbers or close a pane merely because it is waiting for input. Multi-step Claude planning sessions commonly require several blocked/working cycles.
+
+For planning tasks, use the child as an iterative collaborator rather than accepting its first draft. Answer its questions, challenge unclear assumptions, ask it to compare alternatives, request revisions, and continue managed back-and-forth until the plan is coherent, complete, and implementation-ready. Only then accept the result and close the pane.
+
+## Pane Lifecycle
+
+A settled result is not automatically disposable. If a child is blocked, asks a question, or needs follow-up, keep its Herdr pane open and respond through the managed `/subagents` controls. Once the result is captured, fully complete, and no follow-up is needed, close its Herdr pane with `herdr pane close <pane-id>`. Do not leave completed audit panes open indefinitely.
