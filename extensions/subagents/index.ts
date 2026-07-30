@@ -117,12 +117,28 @@ function truncatedOutput(
   return text;
 }
 
+function canonicalPath(candidate: string) {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+function isWithin(candidate: string, root: string) {
+  const relative = path.relative(canonicalPath(root), canonicalPath(candidate));
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
+}
+
 /**
- * Same-directory children inherit the live parent decision. An alternate cwd
- * is trusted only when pi's persisted trust store explicitly trusts it (or a
- * containing directory); unreadable/invalid trust data fails closed.
+ * Same-directory children inherit the live parent decision. Pi's user-owned
+ * global agent directory is inherently trusted; any other alternate cwd must
+ * be explicitly trusted in the persisted store. Invalid data fails closed.
  */
-function resolveChildProjectTrust(options: {
+export function resolveChildProjectTrust(options: {
   parentCwd: string;
   childCwd: string;
   parentTrusted: boolean;
@@ -130,6 +146,7 @@ function resolveChildProjectTrust(options: {
   if (path.resolve(options.childCwd) === path.resolve(options.parentCwd)) {
     return options.parentTrusted;
   }
+  if (isWithin(options.childCwd, getAgentDir())) return true;
   try {
     const trustStore = new ProjectTrustStore(getAgentDir());
     return trustStore.get(options.childCwd) === true;

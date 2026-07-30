@@ -3,8 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { SpawnTask } from "./src/domain.ts";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { resolveChildProjectTrust } from "./index.ts";
 import { agentArguments, sessionRun } from "./src/backends/herdr.ts";
+import type { SpawnTask } from "./src/domain.ts";
 
 function task(projectTrusted: boolean): SpawnTask {
   return {
@@ -17,6 +19,17 @@ function task(projectTrusted: boolean): SpawnTask {
     },
   };
 }
+
+test("the user-owned global Pi agent directory is a trusted child cwd", () => {
+  assert.equal(
+    resolveChildProjectTrust({
+      parentCwd: "/tmp/untrusted-parent",
+      childCwd: join(getAgentDir(), "extensions", "subagents"),
+      parentTrusted: false,
+    }),
+    true,
+  );
+});
 
 test("interactive harness arguments preserve trust and orchestration boundaries", () => {
   const untrustedClaude = agentArguments("claude", task(false), undefined);
