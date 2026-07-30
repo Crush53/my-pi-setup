@@ -56,6 +56,14 @@ Requires Claude Code to be installed and authenticated.
 
 Requires the Codex CLI to be installed and authenticated.
 
+## Code Reviews
+
+Use each harness's native review skill with its documented invocation syntax:
+
+- **Claude Code:** explicitly ask Claude to use `/review`; Claude resolves this to `Skill(review)`. If that skill redirects working-branch reviews to `/code-review`, follow the redirect.
+- **Codex:** start the task prompt with `$review-agent`. This invokes `~/.codex/skills/.system/review-agent/SKILL.md`. Do not use `/review` as a Codex skill invocation; `/review` is an interactive TUI command, not the installed review skill.
+- If a requested workflow or skill name is ambiguous, inspect the harness's installed `SKILL.md` before spawning rather than guessing its syntax.
+
 ## Spawn and Manage
 
 Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, and optional `working_dir`, `model`, and `reasoning_effort`. At most four subagents run concurrently. Inside Herdr, the spawn result includes the child pane ID and the user can click or focus that pane to audit the native agent UI.
