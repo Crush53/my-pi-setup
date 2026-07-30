@@ -6,7 +6,6 @@ import { randomBytes } from "node:crypto";
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
-import { preferredCodexEffort } from "./codex.ts";
 import { resolvePiModel } from "./pi.ts";
 import type {
   BackendName,
@@ -240,6 +239,26 @@ export function normalizedEffortForClaude(effort: ReasoningEffort | undefined) {
   }
 }
 
+export function normalizedEffortForNativeCodex(
+  effort: ReasoningEffort | undefined,
+) {
+  switch (effort) {
+    case "off":
+      return "none";
+    case "minimal":
+      return "low";
+    case "low":
+    case "medium":
+    case "high":
+    case "xhigh":
+      return effort;
+    case "max":
+      return "xhigh";
+    case undefined:
+      return undefined;
+  }
+}
+
 function modelLabel(
   kind: BackendName,
   task: SpawnTask,
@@ -289,7 +308,7 @@ export function agentArguments(
   ];
   if (task.parent.projectTrusted) args.push("--dangerously-bypass-hook-trust");
   if (task.model) args.push("--model", task.model);
-  const effort = preferredCodexEffort(task.reasoningEffort);
+  const effort = normalizedEffortForNativeCodex(task.reasoningEffort);
   if (effort) args.push("--config", `model_reasoning_effort=\"${effort}\"`);
   return args;
 }

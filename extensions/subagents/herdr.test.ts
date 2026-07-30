@@ -18,6 +18,7 @@ import {
   definedSessionMetaPatch,
   isMissingHerdrTarget,
   normalizedEffortForClaude,
+  normalizedEffortForNativeCodex,
   retryHerdrMonitoring,
   sessionRunSince,
 } from "./src/backends/herdr.ts";
@@ -79,12 +80,33 @@ test("interactive harness arguments preserve orchestration and effort boundaries
     ]);
   }
   assert.ok(trustedCodex.includes('model_reasoning_effort="xhigh"'));
-  assert.deepEqual(
-    (["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const).map(
-      normalizedEffortForClaude,
-    ),
-    ["low", "low", "low", "medium", "high", "xhigh", "max"],
-  );
+  const efforts = [
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ] as const;
+  assert.deepEqual(efforts.map(normalizedEffortForClaude), [
+    "low",
+    "low",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ]);
+  assert.deepEqual(efforts.map(normalizedEffortForNativeCodex), [
+    "none",
+    "low",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "xhigh",
+  ]);
 });
 
 test("Claude transcript paths use its canonical non-alphanumeric encoding", () => {

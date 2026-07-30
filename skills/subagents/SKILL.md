@@ -56,7 +56,7 @@ Requires Claude Code to be installed and authenticated.
 | `gpt-5.6-terra` | `high`             |
 | `gpt-5.6-luna`  | `high`             |
 
-**Thinking budgets accepted by the extension:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Codex maps these to the nearest effort supported by the selected model; `off`/`minimal` become `minimal`, while `max` becomes the highest extension-supported Codex effort.
+**Thinking budgets accepted by the extension:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Codex maps these to the nearest effort supported by the selected model. In the native Herdr CLI, `off` maps to `none`, `minimal` maps to `low`, and `max` maps to the highest broadly supported effort.
 
 Requires the Codex CLI to be installed and authenticated.
 
