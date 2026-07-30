@@ -303,6 +303,25 @@ function textParts(content: unknown) {
     .trim();
 }
 
+function userText(entry: JsonRecord) {
+  const message = record(entry.message);
+  if (message?.role === "user") {
+    const text = textParts(message.content);
+    if (text) return text;
+  }
+
+  const payload = record(entry.payload);
+  if (entry.type === "response_item" && payload?.role === "user") {
+    const text = textParts(payload.content);
+    if (text) return text;
+  }
+  if (entry.type === "event_msg" && payload?.type === "user_message") {
+    const text = stringValue(payload.message);
+    if (text?.trim()) return text.trim();
+  }
+  return undefined;
+}
+
 function assistantText(entry: JsonRecord) {
   const message = record(entry.message);
   if (message?.role === "assistant") {
@@ -326,26 +345,41 @@ function assistantText(entry: JsonRecord) {
   return undefined;
 }
 
-function finalTextFromSession(sessionFilePath: string | undefined) {
-  if (!sessionFilePath || !fs.existsSync(sessionFilePath)) return undefined;
+function sessionRun(
+  sessionFilePath: string | undefined,
+  prompt: string,
+): { promptSeen: boolean; finalText?: string } {
+  if (!sessionFilePath || !fs.existsSync(sessionFilePath)) {
+    return { promptSeen: false };
+  }
   let contents: string;
   try {
     contents = fs.readFileSync(sessionFilePath, "utf8");
   } catch {
-    return undefined;
+    return { promptSeen: false };
   }
-  const lines = contents.split("\n");
-  for (let index = lines.length - 1; index >= 0; index--) {
-    const line = lines[index]?.trim();
+
+  let promptSeen = false;
+  let finalText: string | undefined;
+  for (const rawLine of contents.split("\n")) {
+    const line = rawLine.trim();
     if (!line) continue;
     try {
-      const text = assistantText(JSON.parse(line) as JsonRecord);
-      if (text) return text.slice(0, FINAL_OUTPUT_MAX_LENGTH);
+      const entry = JSON.parse(line) as JsonRecord;
+      const user = userText(entry);
+      if (user?.trim() === prompt.trim()) {
+        promptSeen = true;
+        finalText = undefined;
+        continue;
+      }
+      if (!promptSeen) continue;
+      const assistant = assistantText(entry);
+      if (assistant) finalText = assistant.slice(0, FINAL_OUTPUT_MAX_LENGTH);
     } catch {
       // Ignore malformed or partially flushed trailing records.
     }
   }
-  return undefined;
+  return { promptSeen, finalText };
 }
 
 function makeHerdrSession(kind: BackendName, task: SpawnTask) {
@@ -368,6 +402,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       closed: false,
       activeRun: false,
       runSerial: 0,
+      activePrompt: task.prompt,
       meta: {
         backend: kind,
         modelLabel: modelLabel(kind, task),
@@ -473,6 +508,12 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             await delay(100);
           }
         }
+
+        // agent.start can return while a native TUI is still completing
+        // startup work (notably Codex MCP initialization). Prompts sent during
+        // that window can be swallowed while startup state changes falsely
+        // satisfy agent prompt --wait.
+        await delay(kind === "codex" ? 5_000 : 1_000);
       },
       catch: (error) => new SpawnError({ message: boundedError(error) }),
     });
@@ -526,11 +567,20 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       }, LIVE_READ_INTERVAL_MS);
     };
 
-    const collectFinalText = async () => {
+    const observedPrompt = async (prompt: string) => {
       await refreshMeta();
-      for (let attempt = 0; attempt < 8; attempt++) {
-        const text = finalTextFromSession(state.meta.sessionFilePath);
-        if (text) return text;
+      if (sessionRun(state.meta.sessionFilePath, prompt).promptSeen) return true;
+      const terminal = await readTerminal("recent-unwrapped", 300).catch(
+        () => undefined,
+      );
+      return terminal?.includes(prompt) ?? false;
+    };
+
+    const collectFinalText = async (prompt: string) => {
+      await refreshMeta();
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const run = sessionRun(state.meta.sessionFilePath, prompt);
+        if (run.finalText) return run.finalText;
         await delay(100);
         await refreshMeta();
       }
@@ -575,6 +625,19 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         }
         if (await acceptClaudeWarning()) response = await promptAndWait();
 
+        if (!(await observedPrompt(prompt))) {
+          // A still-initializing TUI can consume the submitted bytes without
+          // creating a user turn. Give startup one more grace period and retry
+          // once, then fail instead of returning the startup screen as success.
+          await delay(2_000);
+          response = await promptAndWait();
+          if (!(await observedPrompt(prompt))) {
+            throw new Error(
+              "Herdr submitted the prompt, but the native agent did not record it.",
+            );
+          }
+        }
+
         const status = nestedString(
           parseJsonOutput(response.stdout),
           "result",
@@ -600,7 +663,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           );
         }
         if (controller.signal.aborted || !state.activeRun || serial !== state.runSerial) return;
-        const finalText = await collectFinalText();
+        const finalText = await collectFinalText(prompt);
         if (finalText) {
           emit({
             _tag: "AssistantMessage",
@@ -610,7 +673,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
         settle(serial, { _tag: "Completed", finalText });
       } catch (error) {
         if (controller.signal.aborted || !state.activeRun || serial !== state.runSerial) return;
-        const partialText = await collectFinalText().catch(() => "");
+        const partialText = await collectFinalText(prompt).catch(() => "");
         settle(serial, {
           _tag: "Failed",
           errorText: boundedError(error),
@@ -622,6 +685,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     const startRun = (prompt: string) => {
       const serial = ++state.runSerial;
       state.activeRun = true;
+      state.activePrompt = prompt;
       runController = new AbortController();
       emit({ _tag: "UserMessage", text: prompt });
       emit({ _tag: "RunStarted" });
@@ -676,7 +740,9 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             timeoutMs: 3_000,
           }).catch(() => undefined);
         });
-        const partialText = await collectFinalText().catch(() => "");
+        const partialText = await collectFinalText(state.activePrompt).catch(
+          () => "",
+        );
         settle(serial, {
           _tag: "Interrupted",
           partialText: partialText || undefined,
