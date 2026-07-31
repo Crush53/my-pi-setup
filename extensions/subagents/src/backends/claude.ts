@@ -334,7 +334,7 @@ const makeClaudeSession = (
             allowDangerouslySkipPermissions: true,
             // Keep child orchestration inside this extension's global manager
             // and concurrency cap rather than Claude Code's native subagents.
-            disallowedTools: ["Agent", "Task"],
+            disallowedTools: ["Agent", "Task", "Workflow"],
             // For cwds pi marked untrusted, restrict to user-level settings so
             // an untrusted project's config cannot reconfigure the child.
             ...(task.parent.projectTrusted

@@ -15,9 +15,9 @@
  *
  * Architecture: Effect v4 generators throughout (backends -> manager ->
  * runtime); this file is the async boundary where tool handlers run effects
- * against one shared ManagedRuntime. All three backends are real: pi runs
- * in-process SDK sessions, claude drives the Claude Agent SDK, codex speaks
- * JSON-RPC to a scoped `codex app-server` process.
+ * against one shared ManagedRuntime. Inside Herdr, all harnesses launch their
+ * real interactive CLIs in visible panes. Outside Herdr, pi runs in-process,
+ * Claude uses its Agent SDK, and Codex uses `codex app-server` JSON-RPC.
  */
 
 import * as fs from "node:fs";
@@ -96,6 +96,7 @@ function describeSubagent(snap: SubagentSnapshot) {
     formatContextUtilization(snap.usage),
     formatElapsed(snap),
     snap.cwd,
+    snap.meta.herdrPaneId ? `pane ${snap.meta.herdrPaneId}` : undefined,
   ].filter(Boolean);
   return `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
 }
@@ -116,12 +117,28 @@ function truncatedOutput(
   return text;
 }
 
+function canonicalPath(candidate: string) {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+function isWithin(candidate: string, root: string) {
+  const relative = path.relative(canonicalPath(root), canonicalPath(candidate));
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
+}
+
 /**
- * Same-directory children inherit the live parent decision. An alternate cwd
- * is trusted only when pi's persisted trust store explicitly trusts it (or a
- * containing directory); unreadable/invalid trust data fails closed.
+ * Same-directory children inherit the live parent decision. Pi's user-owned
+ * global agent directory is inherently trusted; any other alternate cwd must
+ * be explicitly trusted in the persisted store. Invalid data fails closed.
  */
-function resolveChildProjectTrust(options: {
+export function resolveChildProjectTrust(options: {
   parentCwd: string;
   childCwd: string;
   parentTrusted: boolean;
@@ -129,6 +146,10 @@ function resolveChildProjectTrust(options: {
   if (path.resolve(options.childCwd) === path.resolve(options.parentCwd)) {
     return options.parentTrusted;
   }
+  // An untrusted parent must not escape into any trusted directory and launch
+  // a permission-bypassing child there.
+  if (!options.parentTrusted) return false;
+  if (isWithin(options.childCwd, getAgentDir())) return true;
   try {
     const trustStore = new ProjectTrustStore(getAgentDir());
     return trustStore.get(options.childCwd) === true;
@@ -341,6 +362,7 @@ export default function (pi: ExtensionAPI) {
               harness,
               modelLabel: snap.meta.modelLabel ?? "?",
               cwd,
+              herdrPaneId: snap.meta.herdrPaneId,
             }),
           },
         ],
@@ -350,6 +372,8 @@ export default function (pi: ExtensionAPI) {
           cwd,
           harness,
           model: snap.meta.modelLabel,
+          herdrPaneId: snap.meta.herdrPaneId,
+          herdrAgentName: snap.meta.herdrAgentName,
         },
       };
     },

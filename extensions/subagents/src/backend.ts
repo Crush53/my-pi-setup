@@ -2,10 +2,9 @@
  * The unified backend interface: one `SubagentBackend` per agent runtime
  * (pi, Claude Code, Codex), all producing the same `SubagentSession` shape.
  *
- * Planned real implementations (currently stubbed in ./backends/):
- * - pi: in-process `createAgentSession()` via the pi SDK.
- * - claude: `@anthropic-ai/claude-agent-sdk` `query()` in streaming-input mode.
- * - codex: `codex app-server` child process speaking JSON-RPC over stdio.
+ * Implementations:
+ * - inside Herdr: real interactive Pi, Claude Code, and Codex CLIs in panes;
+ * - outside Herdr: in-process Pi SDK, Claude Agent SDK, and Codex app-server.
  */
 
 import type { Effect, Scope, Stream } from "effect";

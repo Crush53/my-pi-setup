@@ -73,6 +73,9 @@ export interface SubagentMeta {
   readonly sessionFilePath?: string;
   /** Claude session id / Codex conversation id. */
   readonly nativeSessionId?: string;
+  /** Herdr pane and live agent alias when the parent is running inside Herdr. */
+  readonly herdrPaneId?: string;
+  readonly herdrAgentName?: string;
 }
 
 // --- Transcript ------------------------------------------------------------
@@ -151,6 +154,8 @@ export type SubagentEvent =
       readonly _tag: "AssistantMessage";
       readonly parts: ReadonlyArray<TranscriptPart>;
     }
+  /** Replace the live preview with a Herdr terminal screen snapshot. */
+  | { readonly _tag: "LiveSnapshot"; readonly text: string }
   | {
       readonly _tag: "ToolStart";
       readonly toolId: string;

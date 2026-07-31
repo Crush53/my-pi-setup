@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Effect, Layer, ManagedRuntime } from "effect";
+import { Effect, Layer, ManagedRuntime, Stream } from "effect";
 import { BackendRegistry, type SubagentBackend } from "./src/backend.ts";
 import { piBackend } from "./src/backends/pi.ts";
 import { makeStubBackend } from "./src/backends/stub.ts";
@@ -122,6 +122,60 @@ test("FAIL: prompts settle as errors; unconsumed settles are delivered", async (
     assert.match(failed?.errorText ?? "", /task failed/);
     assert.deepEqual(settled, [{ id: snap.id, consumed: false }]);
   });
+});
+
+test("cancel force-disposes sessions whose interrupt defects", async () => {
+  let finalized = false;
+  const defectiveBackend: SubagentBackend = {
+    name: "codex",
+    capabilities: {
+      steering: true,
+      modelSelection: true,
+      reasoningEffort: true,
+    },
+    available: Effect.succeed(true),
+    spawn: () =>
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            finalized = true;
+          }),
+        );
+        return {
+          meta: Effect.succeed({ backend: "codex" as const }),
+          events: Stream.never,
+          send: () => Effect.void,
+          interrupt: Effect.die(new Error("interrupt defect")),
+        };
+      }),
+  };
+  const runtime = ManagedRuntime.make(
+    SubagentManagerLive.pipe(
+      Layer.provide(
+        Layer.succeed(
+          BackendRegistry,
+          new Map<BackendName, SubagentBackend>([["codex", defectiveBackend]]),
+        ),
+      ),
+    ),
+  );
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(
+      runtime,
+      manager.spawn("codex", task("defective interrupt")),
+    );
+    const report = await runTool(runtime, manager.cancel([snap.id]));
+    assert.equal(report[0]?.cancelled, true);
+    assert.equal(manager.view.get(snap.id)?.status, "error");
+    assert.match(
+      manager.view.get(snap.id)?.errorText ?? "",
+      /Abort failed or exceeded/,
+    );
+    assert.equal(finalized, true);
+  } finally {
+    await runtime.dispose();
+  }
 });
 
 test("cancel interrupts a running stub subagent", async () => {
