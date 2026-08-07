@@ -5,7 +5,7 @@ description: invoke this skill when the user asks you to use subagents
 
 # Subagents
 
-Each subagent has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. When the parent runs inside Herdr, each child is a real interactive agent in a visible sibling pane for live auditing. Use `/subagents` for managed takeover; input typed directly into a settled child pane is not collected by Pi. Outside Herdr, children use headless backends. Give every child a self-contained prompt with paths, constraints, and the expected report.
+Each subagent has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. When the parent runs inside Herdr, each child is a real interactive agent in a separate full-size tab for live auditing without resizing the parent Pi terminal. Use `subagent_send` or `/subagents` for managed follow-up; input typed directly into a settled child terminal is not collected by Pi. Outside Herdr, children use headless backends. Give every child a self-contained prompt with paths, constraints, and the expected report.
 
 ## Harness Skills
 
@@ -42,6 +42,8 @@ Pi can use any model shown by `pi --list-models`. Prefer `provider/model-id`; a 
 
 **Thinking budgets:** `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The extension maps these to Claude thinking-token budgets: 0, 1,024, 4,096, 10,000, 16,000, 32,000, and 63,999 tokens respectively.
 
+For planning work, pass `mode: "plan"` to `subagent_spawn`. This starts Claude in native read-only plan mode. Keep revisions in the same session with `subagent_send`; do not spawn a replacement planner after the first draft.
+
 Requires Claude Code to be installed and authenticated.
 
 ## Codex Harness
@@ -69,15 +71,16 @@ Use each harness's native review skill with its documented invocation syntax:
 
 ## Spawn and Manage
 
-Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, and optional `working_dir`, `model`, and `reasoning_effort`. At most four subagents run concurrently. Inside Herdr, the spawn result includes the child pane ID and the user can click or focus that pane to audit the native agent UI.
+Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, and optional `working_dir`, `model`, `reasoning_effort`, and `mode`. At most four subagents run concurrently. Inside Herdr, the spawn result includes the child tab and pane IDs so the user can audit the native agent UI without shrinking the parent.
 
+- `subagent_send({ id, message })`: steer a running child or continue a settled child in the same session. Use it for plan revisions and follow-up work rather than spawning a replacement.
 - `subagent_check({ id })`: peek without blocking.
 - `subagent_list()`: list all runs.
 - `subagent_wait({ ids })`: block only when results are required to proceed.
 - `subagent_cancel({ ids })`: stop runs while preserving partial transcripts.
 - `/subagents`: inspect or take over a run interactively.
 
-Results return automatically. After spawning, continue useful parent work instead of immediately waiting.
+Results return automatically. After spawning, continue useful parent work instead of immediately waiting. If a child fails on a transient WebSocket/provider-overload error, keep its terminal and use `subagent_send` after a backoff to ask it to inspect current state and continue safely. Do not blindly replay a side-effecting prompt or spawn a replacement session.
 
 ## Interactive Questions and Planning
 
@@ -93,8 +96,8 @@ A native child can enter Herdr's `blocked` state for permission prompts, plannin
 
 Do not guess option numbers or close a pane merely because it is waiting for input. Multi-step Claude planning sessions commonly require several blocked/working cycles.
 
-For planning tasks, use the child as an iterative collaborator rather than accepting its first draft. Answer its questions, challenge unclear assumptions, ask it to compare alternatives, request revisions, and continue managed back-and-forth until the plan is coherent, complete, and implementation-ready. Only then accept the result and close the pane.
+For planning tasks, launch Claude with `mode: "plan"` and use the child as an iterative collaborator rather than accepting its first draft. Answer its questions, challenge unclear assumptions, ask it to compare alternatives, and request revisions with `subagent_send` on the same id until the plan is coherent, complete, and implementation-ready. Only then accept the result and close the tab.
 
-## Pane Lifecycle
+## Terminal Lifecycle
 
-A settled result is not automatically disposable. If a child is blocked, asks a question, or needs follow-up, keep its Herdr pane open and respond through the managed `/subagents` controls. Once the result is captured, fully complete, and no follow-up is needed, close its Herdr pane with `herdr pane close <pane-id>`. Do not leave completed audit panes open indefinitely.
+A settled result is not automatically disposable. If a child is blocked, asks a question, or needs follow-up, keep its Herdr tab open and respond through `subagent_send` or the managed `/subagents` controls. Once the result is captured, fully complete, and no follow-up is needed, close its full-size Herdr tab with `herdr tab close <tab-id>` (or close its sole pane). Do not leave completed audit tabs open indefinitely.

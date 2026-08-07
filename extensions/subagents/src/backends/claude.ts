@@ -327,11 +327,13 @@ const makeClaudeSession = (
           prompt: input,
           options: {
             cwd: task.cwd,
-            // Headless children cannot answer approval prompts. The caller
-            // already chose to launch an autonomous subagent, so let it use
-            // its tools without interactive permission checks.
-            permissionMode: "bypassPermissions",
-            allowDangerouslySkipPermissions: true,
+            // Explicit planning agents stay read-only. Normal autonomous
+            // children cannot answer approval prompts, so bypass them only
+            // outside native plan mode.
+            permissionMode: task.mode === "plan" ? "plan" : "bypassPermissions",
+            ...(task.mode === "plan"
+              ? {}
+              : { allowDangerouslySkipPermissions: true }),
             // Keep child orchestration inside this extension's global manager
             // and concurrency cap rather than Claude Code's native subagents.
             disallowedTools: ["Agent", "Task", "Workflow"],

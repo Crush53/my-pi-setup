@@ -33,6 +33,9 @@ export const REASONING_EFFORTS = [
 ] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
+export const SUBAGENT_MODES = ["default", "plan"] as const;
+export type SubagentMode = (typeof SUBAGENT_MODES)[number];
+
 export type SubagentStatus = "running" | "done" | "error";
 
 /** Parent-session context resolved by the tool layer and passed opaquely. */
@@ -60,6 +63,8 @@ export interface SpawnTask {
   readonly model?: string;
   /** Shared effort scale; each backend maps it to its native equivalent. */
   readonly reasoningEffort?: ReasoningEffort;
+  /** Native Claude planning mode; other harnesses currently use default mode. */
+  readonly mode?: SubagentMode;
   readonly parent: ParentContext;
 }
 
@@ -73,7 +78,8 @@ export interface SubagentMeta {
   readonly sessionFilePath?: string;
   /** Claude session id / Codex conversation id. */
   readonly nativeSessionId?: string;
-  /** Herdr pane and live agent alias when the parent is running inside Herdr. */
+  /** Herdr tab, pane, and live agent alias when the parent runs inside Herdr. */
+  readonly herdrTabId?: string;
   readonly herdrPaneId?: string;
   readonly herdrAgentName?: string;
 }

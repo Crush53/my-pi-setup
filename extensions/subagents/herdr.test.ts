@@ -15,6 +15,7 @@ import {
   agentArguments,
   captureSessionCursor,
   claudeSessionPath,
+  createdTabTarget,
   definedSessionMetaPatch,
   isMissingHerdrTarget,
   normalizedEffortForClaude,
@@ -58,11 +59,29 @@ test("the global Pi agent directory requires a trusted parent", () => {
 });
 
 test("interactive harness arguments preserve orchestration and effort boundaries", () => {
+  const pi = agentArguments("pi", task(true), "openai-codex/gpt-5.6-sol");
+  assert.match(pi[pi.indexOf("--exclude-tools") + 1] ?? "", /subagent_send/);
+
   const claude = agentArguments("claude", task(true), undefined);
   assert.equal(
     claude[claude.indexOf("--disallowed-tools") + 1],
     "Agent,Task,Workflow",
   );
+  assert.ok(claude.includes("--dangerously-skip-permissions"));
+  assert.ok(!claude.includes("--permission-mode"));
+  const planningClaude = agentArguments(
+    "claude",
+    { ...task(true), mode: "plan" },
+    undefined,
+  );
+  assert.deepEqual(
+    planningClaude.slice(
+      planningClaude.indexOf("--permission-mode"),
+      planningClaude.indexOf("--permission-mode") + 2,
+    ),
+    ["--permission-mode", "plan"],
+  );
+  assert.ok(!planningClaude.includes("--dangerously-skip-permissions"));
 
   const trustedCodex = agentArguments(
     "codex",
@@ -167,6 +186,7 @@ test("session cursors isolate repeated and transformed prompts to the new turn",
         matchingPromptCount: 1,
         partialText: "new answer",
         finalText: "new answer",
+        runError: undefined,
       },
     );
 
@@ -191,6 +211,7 @@ test("session cursors isolate repeated and transformed prompts to the new turn",
         matchingPromptCount: 1,
         partialText: undefined,
         finalText: undefined,
+        runError: undefined,
       },
     );
   } finally {
@@ -273,6 +294,7 @@ test("native transcripts require harness-specific terminal answers", () => {
         matchingPromptCount: 0,
         partialText: undefined,
         finalText: undefined,
+        runError: undefined,
       },
     );
     appendFileSync(
@@ -368,16 +390,47 @@ test("native transcripts require harness-specific terminal answers", () => {
     );
     appendFileSync(
       pi,
+      `${JSON.stringify({ type: "message", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "Codex error: servers overloaded" } })}\n`,
+    );
+    let piRun = sessionRunSince(
+      "pi",
+      pi,
+      { sessionFilePath: pi, offset: 0 },
+      "managed",
+    );
+    assert.equal(piRun.runError, "Codex error: servers overloaded");
+    assert.equal(piRun.finalText, undefined);
+    appendFileSync(
+      pi,
       `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "pi complete" }], stopReason: "stop" } })}\n`,
     );
-    assert.equal(
-      sessionRunSince("pi", pi, { sessionFilePath: pi, offset: 0 }, "managed")
-        .finalText,
-      "pi complete",
+    piRun = sessionRunSince(
+      "pi",
+      pi,
+      { sessionFilePath: pi, offset: 0 },
+      "managed",
     );
+    assert.equal(piRun.finalText, "pi complete");
+    assert.equal(piRun.runError, undefined);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("Herdr tab creation resolves a full-size terminal target", () => {
+  assert.deepEqual(
+    createdTabTarget({
+      result: {
+        root_pane: { pane_id: "w1:p2" },
+        tab: { tab_id: "w1:t2" },
+      },
+    }),
+    { paneId: "w1:p2", tabId: "w1:t2" },
+  );
+  assert.equal(
+    createdTabTarget({ result: { tab: { tab_id: "w1:t2" } } }),
+    undefined,
+  );
 });
 
 test("session metadata refreshes never erase known values", () => {
@@ -402,6 +455,10 @@ test("missing Herdr agents and panes are recognized as closed", () => {
   );
   assert.equal(
     isMissingHerdrTarget(new Error('{"error":{"code":"pane_not_found"}}')),
+    true,
+  );
+  assert.equal(
+    isMissingHerdrTarget(new Error('{"error":{"code":"tab_not_found"}}')),
     true,
   );
   assert.equal(isMissingHerdrTarget(new Error("temporary failure")), false);
