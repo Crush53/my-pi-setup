@@ -4,8 +4,9 @@
  *
  * Tools (for the parent LLM):
  * - subagent_spawn: fire-and-forget spawn (prompt, title, agent, working_dir,
- *   model, reasoning_effort). Max 4 running at once across all backends.
+ *   model, reasoning_effort, mode). Max 4 running at once across all backends.
  * - subagent_wait: block until the listed subagents settle, return results.
+ * - subagent_send: steer or continue an existing native session.
  * - subagent_cancel: stop one or more running subagents.
  * - subagent_check: peek at a subagent's status and recent activity.
  * - subagent_list: list all subagents.
@@ -16,7 +17,7 @@
  * Architecture: Effect v4 generators throughout (backends -> manager ->
  * runtime); this file is the async boundary where tool handlers run effects
  * against one shared ManagedRuntime. Inside Herdr, all harnesses launch their
- * real interactive CLIs in visible panes. Outside Herdr, pi runs in-process,
+ * real interactive CLIs in separate full-size tabs. Outside Herdr, pi runs in-process,
  * Claude uses its Agent SDK, and Codex uses `codex app-server` JSON-RPC.
  */
 
@@ -46,6 +47,7 @@ import {
   formatElapsed,
   latestText,
   REASONING_EFFORTS,
+  SUBAGENT_MODES,
   type SubagentSnapshot,
 } from "./src/domain.ts";
 import {
@@ -61,6 +63,8 @@ import {
   SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS,
   SUBAGENT_CHECK_TOOL_DESCRIPTION,
   SUBAGENT_LIST_TOOL_DESCRIPTION,
+  SUBAGENT_SEND_PARAMETER_DESCRIPTIONS,
+  SUBAGENT_SEND_TOOL_DESCRIPTION,
   SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS,
   SUBAGENT_SPAWN_PROMPT_GUIDELINES,
   SUBAGENT_SPAWN_PROMPT_SNIPPET,
@@ -96,6 +100,7 @@ function describeSubagent(snap: SubagentSnapshot) {
     formatContextUtilization(snap.usage),
     formatElapsed(snap),
     snap.cwd,
+    snap.meta.herdrTabId ? `tab ${snap.meta.herdrTabId}` : undefined,
     snap.meta.herdrPaneId ? `pane ${snap.meta.herdrPaneId}` : undefined,
   ].filter(Boolean);
   return `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
@@ -316,10 +321,18 @@ export default function (pi: ExtensionAPI) {
           description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.reasoningEffort,
         }),
       ),
+      mode: Type.Optional(
+        StringEnum(SUBAGENT_MODES, {
+          description: SUBAGENT_SPAWN_PARAMETER_DESCRIPTIONS.mode,
+        }),
+      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const manager = await getManager();
       const harness = params.harness;
+      if (params.mode === "plan" && harness !== "claude") {
+        throw new Error('mode "plan" is currently supported only by Claude.');
+      }
 
       const cwd = path.resolve(ctx.cwd, params.working_dir ?? ".");
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
@@ -335,6 +348,7 @@ export default function (pi: ExtensionAPI) {
           cwd,
           model: params.model,
           reasoningEffort: params.reasoning_effort,
+          mode: params.mode,
           parent: {
             parentCwd: ctx.cwd,
             projectTrusted: resolveChildProjectTrust({
@@ -362,6 +376,7 @@ export default function (pi: ExtensionAPI) {
               harness,
               modelLabel: snap.meta.modelLabel ?? "?",
               cwd,
+              herdrTabId: snap.meta.herdrTabId,
               herdrPaneId: snap.meta.herdrPaneId,
             }),
           },
@@ -372,6 +387,8 @@ export default function (pi: ExtensionAPI) {
           cwd,
           harness,
           model: snap.meta.modelLabel,
+          mode: params.mode ?? "default",
+          herdrTabId: snap.meta.herdrTabId,
           herdrPaneId: snap.meta.herdrPaneId,
           herdrAgentName: snap.meta.herdrAgentName,
         },
@@ -468,6 +485,59 @@ export default function (pi: ExtensionAPI) {
             const snap = manager.view.get(id);
             return { id, title: snap?.title, status: snap?.status };
           }),
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_send",
+    label: "Send to Subagent",
+    description: SUBAGENT_SEND_TOOL_DESCRIPTION,
+    parameters: Type.Object({
+      id: Type.String({
+        description: SUBAGENT_SEND_PARAMETER_DESCRIPTIONS.id,
+      }),
+      message: Type.String({
+        description: SUBAGENT_SEND_PARAMETER_DESCRIPTIONS.message,
+      }),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const manager = await getManager();
+      const snap = manager.view.get(params.id);
+      if (!snap || !isModelVisible(snap)) {
+        const known = manager.view
+          .list()
+          .filter(isModelVisible)
+          .map((entry) => entry.id);
+        throw new Error(
+          `Unknown subagent id "${params.id}". Known: ${known.join(", ") || "none"}.`,
+        );
+      }
+      const message = params.message.trim();
+      if (!message) throw new Error("Follow-up message cannot be empty.");
+
+      await runTool(getRuntime(), manager.send(params.id, message), {
+        signal,
+        interruptMessage:
+          "Subagent follow-up submission aborted; inspect the existing session before retrying.",
+      });
+      resultDelivery.consume([params.id]);
+      const updated = manager.view.get(params.id);
+      const action = snap.status === "running" ? "Steered" : "Continued";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${action} ${params.id} "${snap.title}" in the same session.`,
+          },
+        ],
+        details: {
+          id: params.id,
+          title: snap.title,
+          status: updated?.status,
+          herdrTabId: updated?.meta.herdrTabId,
+          herdrPaneId: updated?.meta.herdrPaneId,
         },
       };
     },

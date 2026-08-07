@@ -27,6 +27,7 @@ const FINAL_OUTPUT_MAX_LENGTH = 1024 * 1024;
 const CHILD_EXCLUDED_TOOLS = [
   "subagent_spawn",
   "subagent_wait",
+  "subagent_send",
   "subagent_cancel",
   "subagent_check",
   "subagent_list",
@@ -62,7 +63,8 @@ export function isMissingHerdrTarget(error: unknown) {
   const message = boundedError(error);
   return (
     message.includes('"code":"agent_not_found"') ||
-    message.includes('"code":"pane_not_found"')
+    message.includes('"code":"pane_not_found"') ||
+    message.includes('"code":"tab_not_found"')
   );
 }
 
@@ -206,21 +208,13 @@ function herdrAvailable() {
   return process.env.HERDR_ENV === "1" && Boolean(process.env.HERDR_PANE_ID);
 }
 
-function chooseDirection(layout: JsonRecord) {
-  const panes = record(record(layout.result)?.layout)?.panes;
-  const currentId = process.env.HERDR_PANE_ID;
-  if (Array.isArray(panes)) {
-    const current = panes
-      .map(record)
-      .find((pane) => pane?.pane_id === currentId);
-    const rect = record(current?.rect);
-    const width = typeof rect?.width === "number" ? rect.width : undefined;
-    const height = typeof rect?.height === "number" ? rect.height : undefined;
-    if (width !== undefined && height !== undefined) {
-      return width >= 100 && width >= height * 1.6 ? "right" : "down";
-    }
-  }
-  return "right";
+export function createdTabTarget(response: JsonRecord) {
+  const result = record(response.result);
+  const rootPane = record(result?.root_pane);
+  const tab = record(result?.tab);
+  const paneId = stringValue(rootPane?.pane_id);
+  const tabId = stringValue(tab?.tab_id);
+  return paneId && tabId ? { paneId, tabId } : undefined;
 }
 
 export function normalizedEffortForClaude(effort: ReasoningEffort | undefined) {
@@ -288,13 +282,13 @@ export function agentArguments(
   }
 
   if (kind === "claude") {
-    const args = [
-      "--name",
-      `subagent: ${task.title}`,
-      "--dangerously-skip-permissions",
-      "--disallowed-tools",
-      "Agent,Task,Workflow",
-    ];
+    const args = ["--name", `subagent: ${task.title}`];
+    if (task.mode === "plan") {
+      args.push("--permission-mode", "plan");
+    } else {
+      args.push("--dangerously-skip-permissions");
+    }
+    args.push("--disallowed-tools", "Agent,Task,Workflow");
     if (task.model) args.push("--model", task.model);
     const effort = normalizedEffortForClaude(task.reasoningEffort);
     if (effort) args.push("--effort", effort);
@@ -462,6 +456,7 @@ function assistantRecord(kind: BackendName, entry: JsonRecord) {
   const message = record(entry.message);
   const payload = record(entry.payload);
   let text: string | undefined;
+  let errorText: string | undefined;
   let terminal = false;
 
   if (
@@ -471,6 +466,11 @@ function assistantRecord(kind: BackendName, entry: JsonRecord) {
   ) {
     text = textParts(message.content) || undefined;
     terminal = message.stopReason === "stop" || message.stopReason === "length";
+    if (message.stopReason === "error") {
+      errorText =
+        stringValue(message.errorMessage)?.trim() ||
+        "The Pi child model request failed.";
+    }
   } else if (
     kind === "claude" &&
     entry.type === "assistant" &&
@@ -504,7 +504,7 @@ function assistantRecord(kind: BackendName, entry: JsonRecord) {
     terminal = Boolean(text);
   }
 
-  return { text, terminal };
+  return { text, terminal, errorText };
 }
 
 export function captureSessionCursor(sessionFilePath: string | undefined) {
@@ -542,6 +542,7 @@ export function sessionRunSince(
   let matchingPromptCount = 0;
   let partialText: string | undefined;
   let finalText: string | undefined;
+  let runError: string | undefined;
   for (const rawLine of contents.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
@@ -556,14 +557,22 @@ export function sessionRunSince(
           promptSeen = true;
           partialText = undefined;
           finalText = undefined;
+          runError = undefined;
         }
         continue;
       }
       if (!promptSeen) continue;
       const assistant = assistantRecord(kind, entry);
+      if (assistant.errorText) {
+        runError = assistant.errorText.slice(0, 4096);
+        finalText = undefined;
+      }
       if (!assistant.text) continue;
       partialText = assistant.text.slice(0, FINAL_OUTPUT_MAX_LENGTH);
-      if (assistant.terminal) finalText = partialText;
+      if (assistant.terminal) {
+        finalText = partialText;
+        runError = undefined;
+      }
     } catch {
       // Ignore malformed or partially flushed trailing records.
     }
@@ -574,6 +583,7 @@ export function sessionRunSince(
     matchingPromptCount,
     partialText,
     finalText,
+    runError,
   };
 }
 
@@ -645,6 +655,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       0,
       32,
     );
+    let tabId: string | undefined;
     let paneId: string | undefined;
     let runController: AbortController | undefined;
     let liveTimer: ReturnType<typeof setInterval> | undefined;
@@ -669,51 +680,63 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
       } satisfies SubagentMeta as SubagentMeta,
     };
 
-    const layout = yield* Effect.tryPromise({
-      try: () => runHerdr(["pane", "layout", "--current"]),
-      catch: (error) => new SpawnError({ message: boundedError(error) }),
-    });
-    const direction = yield* Effect.try({
-      try: () => chooseDirection(parseJsonOutput(layout.stdout)),
-      catch: (error) => new SpawnError({ message: boundedError(error) }),
-    });
-    paneId = yield* Effect.acquireRelease(
+    const terminal = yield* Effect.acquireRelease(
       Effect.tryPromise({
         try: async () => {
-          const split = await runHerdr([
-            "pane",
-            "split",
-            "--current",
-            "--direction",
-            direction,
-            "--cwd",
-            task.cwd,
-            "--no-focus",
-          ]);
-          const acquiredPaneId = nestedString(
-            parseJsonOutput(split.stdout),
+          const parentPaneId = process.env.HERDR_PANE_ID;
+          if (!parentPaneId) throw new Error("HERDR_PANE_ID is unavailable.");
+          const parent = await runHerdr(["pane", "get", parentPaneId]);
+          const workspaceId = nestedString(
+            parseJsonOutput(parent.stdout),
             "result",
             "pane",
-            "pane_id",
+            "workspace_id",
           );
-          if (!acquiredPaneId) {
-            throw new Error("Herdr pane split returned no pane id.");
+          if (!workspaceId) {
+            throw new Error("Herdr parent pane returned no workspace id.");
           }
-          return acquiredPaneId;
+          const created = await runHerdr([
+            "tab",
+            "create",
+            "--workspace",
+            workspaceId,
+            "--cwd",
+            task.cwd,
+            "--label",
+            `${kind}: ${task.title}`,
+            "--no-focus",
+          ]);
+          const target = createdTabTarget(parseJsonOutput(created.stdout));
+          if (!target) {
+            throw new Error("Herdr tab creation returned no tab or pane id.");
+          }
+          return target;
         },
         catch: (error) => new SpawnError({ message: boundedError(error) }),
       }),
-      (acquiredPaneId) =>
+      (target) =>
         Effect.promise(() =>
-          runHerdr(["pane", "close", acquiredPaneId], {
+          runHerdr(["tab", "close", target.tabId], {
             timeoutMs: 3_000,
           }).then(
             () => undefined,
-            () => undefined,
+            () =>
+              runHerdr(["pane", "close", target.paneId], {
+                timeoutMs: 3_000,
+              }).then(
+                () => undefined,
+                () => undefined,
+              ),
           ),
         ),
     );
-    state.meta = { ...state.meta, herdrPaneId: paneId };
+    tabId = terminal.tabId;
+    paneId = terminal.paneId;
+    state.meta = {
+      ...state.meta,
+      herdrTabId: tabId,
+      herdrPaneId: paneId,
+    };
 
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
@@ -756,7 +779,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           }
         }
 
-        if (kind === "claude") {
+        if (kind === "claude" && task.mode !== "plan") {
           for (let attempt = 0; attempt < 30; attempt++) {
             const screen = await runHerdr([
               "pane",
@@ -941,25 +964,34 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     const updateSteeringQueue = () =>
       lifecycleLock.run(updateSteeringQueueUnlocked);
 
-    const collectFinalText = async (
+    const collectFinalResult = async (
       cursor: ReturnType<typeof captureSessionCursor>,
       prompt: string,
     ) => {
+      let latest = sessionRunSince(
+        kind,
+        state.meta.sessionFilePath,
+        cursor,
+        prompt,
+      );
       for (let attempt = 0; attempt < 50; attempt++) {
         await refreshMeta();
         await updateSteeringQueue();
-        const run = sessionRunSince(
+        latest = sessionRunSince(
           kind,
           state.meta.sessionFilePath,
           cursor,
           prompt,
         );
-        if (run.finalText && state.queuedSteers.length === 0) {
-          return run.finalText;
+        if (
+          state.queuedSteers.length === 0 &&
+          (latest.finalText || latest.runError)
+        ) {
+          return latest;
         }
         await delay(Math.min(100 + attempt * 4, 300));
       }
-      return "";
+      return latest;
     };
 
     const settleUnlocked = (serial: number, outcome: RunOutcome) => {
@@ -1019,16 +1051,25 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
     };
 
     const closeCurrentPane = async () => {
-      if (!paneId) return true;
+      if (!paneId && !tabId) return true;
       const closingPaneId = paneId;
+      const closingTabId = tabId;
       try {
-        await runHerdr(["pane", "close", closingPaneId], {
-          timeoutMs: 1_000,
-        });
+        if (closingTabId) {
+          await runHerdr(["tab", "close", closingTabId], {
+            timeoutMs: 1_000,
+          });
+        } else if (closingPaneId) {
+          await runHerdr(["pane", "close", closingPaneId], {
+            timeoutMs: 1_000,
+          });
+        }
+        tabId = undefined;
         paneId = undefined;
         return true;
       } catch (error) {
         if (isMissingHerdrTarget(error)) {
+          tabId = undefined;
           paneId = undefined;
           return true;
         }
@@ -1133,7 +1174,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             break;
           }
           if (
-            run.finalText &&
+            (run.finalText || run.runError) &&
             (currentStatus === "idle" || currentStatus === "done")
           ) {
             completedBeforeWait = true;
@@ -1187,7 +1228,8 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             );
           }
 
-          const finalText = await collectFinalText(cursor, prompt);
+          const completion = await collectFinalResult(cursor, prompt);
+          const finalText = completion.finalText;
           if (finalText) {
             const settled = await lifecycleLock.run(async () => {
               if (
@@ -1211,6 +1253,7 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
             status = await getAgentStatus(controller.signal);
             continue;
           }
+          if (completion.runError) throw new Error(completion.runError);
           status = await getAgentStatus(controller.signal);
           if (status === "working" || status === "blocked") continue;
           if (!blockedSeen || status === "done") {

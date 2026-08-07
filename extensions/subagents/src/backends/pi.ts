@@ -42,6 +42,7 @@ const CHILD_SHUTDOWN_TIMEOUT_MS = 5_000;
 const CHILD_EXCLUDED_TOOL_NAMES = [
   "subagent_spawn",
   "subagent_wait",
+  "subagent_send",
   "subagent_cancel",
   "subagent_check",
   "subagent_list",
