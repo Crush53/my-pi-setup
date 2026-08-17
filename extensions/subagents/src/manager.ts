@@ -74,6 +74,8 @@ interface MutableSnapshot {
   createdAt: number;
   settledAt?: number;
   errorText?: string;
+  inputRequired?: string;
+  inputRequiredVersion: number;
   meta: SubagentMeta;
   usage: { tokens?: number; contextWindow?: number };
   transcript: TranscriptItem[];
@@ -208,15 +210,31 @@ const makeManager = Effect.gen(function* () {
     }
   };
 
-  /** Resolves on the next state change. Interruption unregisters the waiter. */
-  const nextChange = Effect.callback<void>((resume) => {
-    const waiter = () => resume(Effect.void);
-    changeWaiters.push(waiter);
-    return Effect.sync(() => {
-      const index = changeWaiters.indexOf(waiter);
-      if (index >= 0) changeWaiters.splice(index, 1);
+  /**
+   * Resolves on the next state change or immediately when the caller's state
+   * predicate is already true. Registering before the predicate check closes
+   * the lost-wakeup window between inspecting snapshots and yielding.
+   */
+  const nextChangeOr = (ready: () => boolean) =>
+    Effect.callback<void>((resume) => {
+      let active = true;
+      const remove = () => {
+        const index = changeWaiters.indexOf(waiter);
+        if (index >= 0) changeWaiters.splice(index, 1);
+      };
+      const waiter = () => {
+        if (!active) return;
+        active = false;
+        remove();
+        resume(Effect.void);
+      };
+      changeWaiters.push(waiter);
+      if (ready()) waiter();
+      return Effect.sync(() => {
+        active = false;
+        remove();
+      });
     });
-  });
 
   const runningCount = () =>
     [...entries.values()].filter(
@@ -287,6 +305,7 @@ const makeManager = Effect.gen(function* () {
         );
         break;
     }
+    s.inputRequired = undefined;
     s.liveAssistant = undefined;
     entry.liveToolMap.clear();
     s.liveTools = [];
@@ -310,11 +329,20 @@ const makeManager = Effect.gen(function* () {
         s.status = "running";
         s.settledAt = undefined;
         s.errorText = undefined;
+        s.inputRequired = undefined;
         break;
       case "RunSettled":
         settle(entry, event.outcome);
         return; // settle() already notified
+      case "InputRequired":
+        s.inputRequired = bounded(event.message);
+        s.inputRequiredVersion++;
+        break;
+      case "InputResolved":
+        s.inputRequired = undefined;
+        break;
       case "UserMessage":
+        s.inputRequired = undefined;
         appendTranscript(s, {
           kind: "user",
           text: boundedTranscriptText(event.text),
@@ -476,6 +504,7 @@ const makeManager = Effect.gen(function* () {
             cwd: task.cwd,
             status: "running",
             createdAt: Date.now(),
+            inputRequiredVersion: 0,
             meta,
             usage: { contextWindow: meta.contextWindow },
             transcript: [],
@@ -536,8 +565,23 @@ const makeManager = Effect.gen(function* () {
             (id) => entries.get(id)?.snapshot.status === "running",
           );
           if (pending.length === 0) return;
+          if (
+            pending.some(
+              (id) => entries.get(id)?.snapshot.inputRequired !== undefined,
+            )
+          ) {
+            return;
+          }
           onPending?.(pending);
-          yield* nextChange;
+          yield* nextChangeOr(
+            () =>
+              unique.some(
+                (id) => entries.get(id)?.snapshot.inputRequired !== undefined,
+              ) ||
+              unique.every(
+                (id) => entries.get(id)?.snapshot.status !== "running",
+              ),
+          );
         }
       });
       return loop.pipe(
@@ -594,7 +638,9 @@ const makeManager = Effect.gen(function* () {
           concurrency: "unbounded",
         });
         while (running.some((entry) => entry.snapshot.status === "running")) {
-          yield* nextChange;
+          yield* nextChangeOr(() =>
+            running.every((entry) => entry.snapshot.status !== "running"),
+          );
         }
       });
       return work.pipe(

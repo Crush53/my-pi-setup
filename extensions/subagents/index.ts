@@ -56,8 +56,10 @@ import {
 } from "./src/format.ts";
 import { SubagentManager, type SubagentManagerShape } from "./src/manager.ts";
 import {
+  buildSubagentInputRequiredMessage,
   buildSubagentResultMessage,
   buildSubagentSpawnResult,
+  buildTerminalCleanupReminder,
   SUBAGENT_CANCEL_PARAMETER_DESCRIPTIONS,
   SUBAGENT_CANCEL_TOOL_DESCRIPTION,
   SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS,
@@ -103,7 +105,8 @@ function describeSubagent(snap: SubagentSnapshot) {
     snap.meta.herdrTabId ? `tab ${snap.meta.herdrTabId}` : undefined,
     snap.meta.herdrPaneId ? `pane ${snap.meta.herdrPaneId}` : undefined,
   ].filter(Boolean);
-  return `${snap.id} [${snap.status}] "${snap.title}" (${details.join(", ")})`;
+  const status = snap.inputRequired ? "needs-input" : snap.status;
+  return `${snap.id} [${status}] "${snap.title}" (${details.join(", ")})`;
 }
 
 function truncatedOutput(
@@ -169,6 +172,7 @@ export default function (pi: ExtensionAPI) {
   let sessionContext: ExtensionContext | undefined;
   let ui: ExtensionUIContext | undefined;
   let unsubStatus: (() => void) | undefined;
+  const notifiedInputVersions = new Map<string, number>();
   const resultDelivery = createDeferredResultDelivery<SubagentSnapshot>();
 
   const getRuntime = () => (runtime ??= createSubagentRuntime());
@@ -180,8 +184,10 @@ export default function (pi: ExtensionAPI) {
       .then((manager) => {
         manager.view.setOnSettled(onSettled);
         unsubStatus?.();
-        unsubStatus = manager.view.subscribe(() => updateStatus(manager));
-        updateStatus(manager);
+        unsubStatus = manager.view.subscribe(() =>
+          handleManagerChange(manager),
+        );
+        handleManagerChange(manager);
         return manager;
       });
     return managerPromise;
@@ -203,6 +209,44 @@ export default function (pi: ExtensionAPI) {
     );
   };
 
+  const handleManagerChange = (manager: SubagentManagerShape) => {
+    updateStatus(manager);
+    for (const snap of manager.view.list()) {
+      if (
+        snap.origin !== "model" ||
+        snap.status !== "running" ||
+        !snap.inputRequired ||
+        snap.inputRequiredVersion <= (notifiedInputVersions.get(snap.id) ?? 0)
+      ) {
+        continue;
+      }
+      notifiedInputVersions.set(snap.id, snap.inputRequiredVersion);
+      ui?.notify(`Subagent “${snap.title}” needs input`, "warning");
+      if (!sessionContext) continue;
+      pi.sendMessage(
+        {
+          customType: "subagent-input-required",
+          content: buildSubagentInputRequiredMessage({
+            id: snap.id,
+            title: snap.title,
+            message: snap.inputRequired,
+            herdrTabId: snap.meta.herdrTabId,
+            herdrPaneId: snap.meta.herdrPaneId,
+          }),
+          display: true,
+          details: {
+            id: snap.id,
+            title: snap.title,
+            status: snap.status,
+            herdrTabId: snap.meta.herdrTabId,
+            herdrPaneId: snap.meta.herdrPaneId,
+          },
+        },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+    }
+  };
+
   const deliverResult = (snap: SubagentSnapshot) => {
     pi.sendMessage(
       {
@@ -213,9 +257,17 @@ export default function (pi: ExtensionAPI) {
           status: snap.status,
           errorText: snap.errorText,
           output: truncatedOutput(snap),
+          herdrTabId: snap.meta.herdrTabId,
+          herdrPaneId: snap.meta.herdrPaneId,
         }),
         display: true,
-        details: { id: snap.id, title: snap.title, status: snap.status },
+        details: {
+          id: snap.id,
+          title: snap.title,
+          status: snap.status,
+          herdrTabId: snap.meta.herdrTabId,
+          herdrPaneId: snap.meta.herdrPaneId,
+        },
       },
       { deliverAs: "followUp", triggerTurn: true },
     );
@@ -276,6 +328,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     sessionContext = undefined;
     resultDelivery.clear();
+    notifiedInputVersions.clear();
     unsubStatus?.();
     unsubStatus = undefined;
     ui?.setStatus("subagents", undefined);
@@ -450,15 +503,29 @@ export default function (pi: ExtensionAPI) {
           sections.push(`## ${id}\n\n(no longer tracked)`);
           continue;
         }
-        const verb = snap.status === "error" ? "failed" : "finished";
+        const needsInput =
+          snap.status === "running" && snap.inputRequired !== undefined;
+        const verb = needsInput
+          ? "needs input"
+          : snap.status === "error"
+            ? "failed"
+            : "finished";
         let section = `## ${snap.id} "${snap.title}" ${verb}`;
         if (snap.errorText) section += `\nError: ${snap.errorText}`;
+        if (needsInput) section += `\nInput required: ${snap.inputRequired}`;
         const headerBytes = Buffer.byteLength(section, "utf8") + 2;
         const outputBudget = Math.max(
           512,
           Math.min(WAIT_PER_AGENT_MAX_BYTES, remainingBytes - headerBytes),
         );
         section += `\n\n${truncatedOutput(snap, outputBudget)}`;
+        if (!needsInput) {
+          const cleanup = buildTerminalCleanupReminder({
+            herdrTabId: snap.meta.herdrTabId,
+            herdrPaneId: snap.meta.herdrPaneId,
+          });
+          if (cleanup) section += `\n\n${cleanup}`;
+        }
         const sectionBytes = Buffer.byteLength(section, "utf8");
         if (sectionBytes > remainingBytes) {
           sections.push(
@@ -483,7 +550,14 @@ export default function (pi: ExtensionAPI) {
         details: {
           results: ids.map((id) => {
             const snap = manager.view.get(id);
-            return { id, title: snap?.title, status: snap?.status };
+            return {
+              id,
+              title: snap?.title,
+              status: snap?.status,
+              inputRequired: snap?.inputRequired,
+              herdrTabId: snap?.meta.herdrTabId,
+              herdrPaneId: snap?.meta.herdrPaneId,
+            };
           }),
         },
       };
@@ -620,6 +694,9 @@ export default function (pi: ExtensionAPI) {
 
       let text = `${describeSubagent(snap)}\nTurns: ${snap.turns}`;
       if (snap.errorText) text += `\nError: ${snap.errorText}`;
+      if (snap.inputRequired) {
+        text += `\nInput required: ${snap.inputRequired}`;
+      }
 
       const output = latestText(snap);
       if (output) {
@@ -629,10 +706,24 @@ export default function (pi: ExtensionAPI) {
       } else if (snap.status === "running") {
         text += "\n\n(no text output yet)";
       }
+      if (snap.status !== "running") {
+        const cleanup = buildTerminalCleanupReminder({
+          herdrTabId: snap.meta.herdrTabId,
+          herdrPaneId: snap.meta.herdrPaneId,
+        });
+        if (cleanup) text += `\n\n${cleanup}`;
+      }
 
       return {
         content: [{ type: "text", text }],
-        details: { id: snap.id, status: snap.status, turns: snap.turns },
+        details: {
+          id: snap.id,
+          status: snap.status,
+          turns: snap.turns,
+          inputRequired: snap.inputRequired,
+          herdrTabId: snap.meta.herdrTabId,
+          herdrPaneId: snap.meta.herdrPaneId,
+        },
       };
     },
   });
@@ -657,6 +748,9 @@ export default function (pi: ExtensionAPI) {
             title: snap.title,
             harness: snap.backend,
             status: snap.status,
+            inputRequired: snap.inputRequired,
+            herdrTabId: snap.meta.herdrTabId,
+            herdrPaneId: snap.meta.herdrPaneId,
           })),
         },
       };

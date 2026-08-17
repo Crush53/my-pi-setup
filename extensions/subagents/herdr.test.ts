@@ -24,6 +24,10 @@ import {
   sessionRunSince,
 } from "./src/backends/herdr.ts";
 import type { SpawnTask } from "./src/domain.ts";
+import {
+  buildSubagentInputRequiredMessage,
+  buildSubagentResultMessage,
+} from "./src/prompt.ts";
 import { shouldUseHerdrBackend } from "./src/runtime.ts";
 
 function task(projectTrusted: boolean): SpawnTask {
@@ -483,6 +487,30 @@ test("monitoring retries transient failures but not missing agents", async () =>
     /agent_not_found/,
   );
   assert.equal(attempts, 1);
+});
+
+test("model-facing lifecycle messages require input handling and cleanup", () => {
+  assert.match(
+    buildSubagentInputRequiredMessage({
+      id: "sa-7",
+      title: "planner",
+      message: "Waiting for input.",
+      herdrTabId: "w1:t2",
+      herdrPaneId: "w1:p2",
+    }),
+    /needs input[\s\S]*do not leave the planner blocked/,
+  );
+  assert.match(
+    buildSubagentResultMessage({
+      id: "sa-7",
+      title: "planner",
+      status: "done",
+      output: "Plan complete.",
+      herdrTabId: "w1:t2",
+      herdrPaneId: "w1:p2",
+    }),
+    /Terminal cleanup required[\s\S]*close Herdr tab w1:t2/,
+  );
 });
 
 test("node test workers do not inherit the Herdr interactive backend", () => {

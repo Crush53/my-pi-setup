@@ -1212,14 +1212,15 @@ function makeHerdrSession(kind: BackendName, task: SpawnTask) {
           if (status === "blocked") {
             blockedSeen = true;
             emit({
-              _tag: "BackendError",
+              _tag: "InputRequired",
               message:
-                "Herdr reports that the subagent is waiting for input in its pane.",
+                "The native Herdr agent is waiting for input in its terminal.",
             });
             do {
               await delay(100);
               status = await getAgentStatus(controller.signal);
             } while (status === "blocked");
+            emit({ _tag: "InputResolved" });
             continue;
           }
           if (status !== "idle" && status !== "done") {

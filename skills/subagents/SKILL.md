@@ -80,11 +80,11 @@ Call `subagent_spawn` with a complete `prompt`, short `name`, chosen `harness`, 
 - `subagent_cancel({ ids })`: stop runs while preserving partial transcripts.
 - `/subagents`: inspect or take over a run interactively.
 
-Results return automatically. After spawning, continue useful parent work instead of immediately waiting. If a child fails on a transient WebSocket/provider-overload error, keep its terminal and use `subagent_send` after a backoff to ask it to inspect current state and continue safely. Do not blindly replay a side-effecting prompt or spawn a replacement session.
+Results and input-required events return automatically and wake the parent. After spawning, continue useful parent work instead of immediately waiting. Do not poll with sleep timers, repeated `subagent_check`, or repeated `subagent_wait` calls. Use one `subagent_wait` only for a strict phase dependency when no other parent work is possible; it returns early if a requested child needs input. If a child fails on a transient WebSocket/provider-overload error, keep its terminal and use `subagent_send` after a backoff to ask it to inspect current state and continue safely. Do not blindly replay a side-effecting prompt or spawn a replacement session.
 
 ## Interactive Questions and Planning
 
-A native child can enter Herdr's `blocked` state for permission prompts, planning questions, or numbered/custom-choice dialogs. `blocked` is not completion.
+A native child can enter Herdr's `blocked` state for permission prompts, planning questions, or numbered/custom-choice dialogs. `blocked` is not completion. The manager emits an automatic input-required follow-up and any active `subagent_wait` returns early; respond as soon as that notification arrives rather than waiting for the user to notice the terminal.
 
 1. Keep the manager entry and Herdr pane open.
 2. Read the latest pane snapshot to capture the exact question and options.
@@ -96,8 +96,8 @@ A native child can enter Herdr's `blocked` state for permission prompts, plannin
 
 Do not guess option numbers or close a pane merely because it is waiting for input. Multi-step Claude planning sessions commonly require several blocked/working cycles.
 
-For planning tasks, launch Claude with `mode: "plan"` and use the child as an iterative collaborator rather than accepting its first draft. Answer its questions, challenge unclear assumptions, ask it to compare alternatives, and request revisions with `subagent_send` on the same id until the plan is coherent, complete, and implementation-ready. Only then accept the result and close the tab.
+For planning tasks, launch Claude with `mode: "plan"` and use the child as an iterative collaborator rather than accepting its first draft. Answer its questions, challenge unclear assumptions, ask it to compare alternatives, and request revisions with `subagent_send` on the same id until the plan is coherent, complete, and implementation-ready. At Claude's final **Ready to code?** dialog, a planning-only child must **never** choose “Yes”/auto/manual because that starts implementation inside the planner. Choose **Tell Claude what to change**, then instruct it to return the completed plan as its final answer without implementing. Only then accept the result and close the tab.
 
 ## Terminal Lifecycle
 
-A settled result is not automatically disposable. If a child is blocked, asks a question, or needs follow-up, keep its Herdr tab open and respond through `subagent_send` or the managed `/subagents` controls. Once the result is captured, fully complete, and no follow-up is needed, close its full-size Herdr tab with `herdr tab close <tab-id>` (or close its sole pane). Do not leave completed audit tabs open indefinitely.
+Terminal cleanup is a required completion step, not optional housekeeping. If a child is blocked, asks a question, or the user requested an immediate follow-up, keep its Herdr tab open and respond through `subagent_send` or the managed `/subagents` controls. Otherwise, once the result is captured and no follow-up is needed, close its full-size Herdr tab with `herdr tab close <tab-id>` (or close its sole pane) **before** reporting completion or starting another task. Never claim the delegated work is complete while disposable audit tabs remain open.
