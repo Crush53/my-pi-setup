@@ -149,6 +149,8 @@ export type SubagentEvent =
   // lifecycle (a session can run multiple turns via send())
   | { readonly _tag: "RunStarted" }
   | { readonly _tag: "RunSettled"; readonly outcome: RunOutcome }
+  | { readonly _tag: "InputRequired"; readonly message: string }
+  | { readonly _tag: "InputResolved" }
   // transcript building blocks
   | { readonly _tag: "UserMessage"; readonly text: string }
   | {
@@ -211,6 +213,9 @@ export interface SubagentSnapshot {
   readonly createdAt: number;
   readonly settledAt?: number;
   readonly errorText?: string;
+  /** Active native dialog/question and monotonic notification generation. */
+  readonly inputRequired?: string;
+  readonly inputRequiredVersion: number;
   readonly meta: SubagentMeta;
   readonly usage: { readonly tokens?: number; readonly contextWindow?: number };
   readonly transcript: ReadonlyArray<TranscriptItem>;

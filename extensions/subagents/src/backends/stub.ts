@@ -117,7 +117,15 @@ const makeStubSession = (
     const runTurn = (userText: string, turn: number) =>
       Effect.gen(function* () {
         yield* emit({ _tag: "RunStarted" });
-        const failing = userText.trimStart().startsWith("FAIL:");
+        const trimmed = userText.trimStart();
+        const failing = trimmed.startsWith("FAIL:");
+        if (trimmed.startsWith("BLOCK:")) {
+          yield* emit({
+            _tag: "InputRequired",
+            message: "The stub subagent is waiting for test input.",
+          });
+          return yield* Effect.never;
+        }
 
         const thinking = "Looking at the task and planning an approach...";
         for (const delta of chunked(thinking, 16)) {

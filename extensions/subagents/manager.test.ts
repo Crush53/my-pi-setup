@@ -102,6 +102,40 @@ test("stub subagent completes and delivers a final result", async () => {
   });
 });
 
+test("wait returns promptly when a subagent needs input", async () => {
+  await withManager(async (manager, runtime) => {
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("BLOCK: ask the parent")),
+    );
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        runTool(runtime, manager.waitFor([snap.id])),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("wait did not return for input-required")),
+            2_000,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    const blocked = manager.view.get(snap.id);
+    assert.equal(blocked?.status, "running");
+    assert.equal(
+      blocked?.inputRequired,
+      "The stub subagent is waiting for test input.",
+    );
+    assert.equal(blocked?.inputRequiredVersion, 1);
+
+    await runTool(runtime, manager.cancel([snap.id]));
+  });
+});
+
 test("FAIL: prompts settle as errors; unconsumed settles are delivered", async () => {
   await withManager(async (manager, runtime) => {
     const settled: Array<{ id: string; consumed: boolean }> = [];

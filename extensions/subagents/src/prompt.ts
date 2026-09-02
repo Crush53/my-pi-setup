@@ -17,10 +17,10 @@ export const SUBAGENT_SPAWN_PROMPT_GUIDELINES = [
   "When running inside Herdr, subagent_spawn creates a separate full-size tab for auditing without resizing the parent Pi terminal. Input typed directly into a settled child terminal is outside Pi's manager and is not collected or delivered; use subagent_send or the managed /subagents controls for follow-up turns.",
   "Continue an existing subagent with subagent_send instead of spawning a replacement when the user revises a completed plan, requests follow-up work, or asks to retry after a transient provider/WebSocket overload. Preserve the same transcript and pane. Do not blindly replay side-effecting work after an ambiguous transport failure; tell the child to inspect current state and continue safely.",
   "When delegating planning to Claude, set mode to plan so Fable starts in native read-only plan mode. Iterate on that same agent with subagent_send until the plan is accepted; do not spawn a replacement planner for revisions.",
-  "After subagent_spawn, keep working; results arrive automatically. Only call subagent_wait when you cannot proceed without the result.",
+  "After subagent_spawn, keep working and rely on automatic completion/input-required notifications. Do not poll with sleep timers, repeated subagent_check calls, or repeated subagent_wait calls. Use one subagent_wait only for a strict phase dependency when you truly cannot do other work; it returns early if a child needs input.",
   "When a Herdr child is blocked on a routine non-permission TUI question, inspect its pane and answer autonomously from the task context using herdr pane send-keys/send-text; ask the user only for genuinely user-only preferences, missing requirements, credentials, or destructive authorization. Never approve a permission or project-trust prompt for a Pi child launched from an untrusted project; leave it blocked or cancel it and ask the user to establish trust explicitly.",
-  "For planning delegations, iterate with the child: answer questions, challenge assumptions, compare alternatives, and request revisions until the plan is implementation-ready rather than accepting the first draft.",
-  "When a Herdr child settles, keep its tab open if it is blocked, asking a question, or needs follow-up. Once its result is captured and no follow-up is needed, close the full-size tab with herdr tab close <tab-id> (or close its sole pane); do not leave completed audit terminals open indefinitely.",
+  "For planning delegations, iterate with the child: answer questions, challenge assumptions, compare alternatives, and request revisions until the plan is implementation-ready rather than accepting the first draft. At Claude's final Ready to code? dialog, a planning-only child MUST NOT select Yes/auto/manual because that starts implementation inside the planner. Select Tell Claude what to change and instruct it to return the completed plan as its final answer without implementing.",
+  "TERMINAL CLEANUP IS A REQUIRED COMPLETION STEP: when a Herdr child settles, keep its tab only if the user requested an immediate follow-up or the child still needs input. Otherwise close the full-size tab with herdr tab close <tab-id> (or close its sole pane) before giving your final response or starting the next task. Never report completion while disposable audit terminals remain open.",
 ];
 
 /** Model-facing schema descriptions for subagent_spawn task and execution options. */
@@ -54,14 +54,17 @@ export function buildSubagentSpawnResult(options: {
     : "";
   return (
     `Spawned subagent ${options.id} "${options.title}" (${options.harness}: ${options.modelLabel}, ${options.cwd}${terminal}).\n` +
-    `It runs in the background. Its result will be delivered to you when it finishes, ` +
-    `or use subagent_wait(ids: ["${options.id}"]) to block for it, subagent_send to continue it, subagent_cancel to stop it, subagent_check to peek, subagent_list to see all.`
+    `It runs in the background. Rely on its automatic completion or input-required notification instead of polling. ` +
+    `Use subagent_send to continue it, subagent_cancel to stop it, subagent_check for a single nonblocking peek, or one subagent_wait only for a strict dependency. ` +
+    (options.herdrPaneId
+      ? `If no immediate follow-up is needed after settlement, you MUST close Herdr tab ${options.herdrTabId ?? "?"} (or pane ${options.herdrPaneId}) before reporting completion.`
+      : "")
   );
 }
 
 /** Describes explicit blocking collection of one or more subagent results. */
 export const SUBAGENT_WAIT_TOOL_DESCRIPTION =
-  "Block until all listed subagents have settled, then return their final outputs. Prefer letting results arrive automatically; use this only when you need a result before continuing.";
+  "Block until all listed subagents settle or any requested subagent needs input. Prefer automatic completion/input-required notifications. Use this once only for a strict phase dependency; never poll by repeatedly calling wait/check or using sleep timers.";
 
 /** Model-facing schema description for the subagent ids to await. */
 export const SUBAGENT_WAIT_PARAMETER_DESCRIPTIONS = {
@@ -100,6 +103,34 @@ export const SUBAGENT_CHECK_PARAMETER_DESCRIPTIONS = {
 export const SUBAGENT_LIST_TOOL_DESCRIPTION =
   "List all subagents (running and finished) with their harness and status.";
 
+export function buildTerminalCleanupReminder(options: {
+  herdrTabId?: string;
+  herdrPaneId?: string;
+}) {
+  if (!options.herdrPaneId) return "";
+  return (
+    `Terminal cleanup required: unless the user requested an immediate follow-up, ` +
+    `close Herdr tab ${options.herdrTabId ?? "?"} (or pane ${options.herdrPaneId}) ` +
+    `before reporting completion or starting another task.`
+  );
+}
+
+export function buildSubagentInputRequiredMessage(options: {
+  id: string;
+  title: string;
+  message: string;
+  herdrTabId?: string;
+  herdrPaneId?: string;
+}) {
+  const terminal = options.herdrPaneId
+    ? ` Inspect Herdr tab ${options.herdrTabId ?? "?"}, pane ${options.herdrPaneId}.`
+    : "";
+  return (
+    `Subagent ${options.id} "${options.title}" needs input. ${options.message}${terminal}\n` +
+    `Respond now through the managed session or paced terminal controls; do not leave the planner blocked and do not start a replacement agent.`
+  );
+}
+
 /** Builds the child completion/failure wrapper injected into the parent model's context. */
 export function buildSubagentResultMessage(options: {
   id: string;
@@ -107,10 +138,14 @@ export function buildSubagentResultMessage(options: {
   status: "running" | "done" | "error";
   errorText?: string;
   output: string;
+  herdrTabId?: string;
+  herdrPaneId?: string;
 }) {
   const verb = options.status === "error" ? "failed" : "finished";
   let text = `Subagent ${options.id} "${options.title}" ${verb}.`;
   if (options.errorText) text += `\nError: ${options.errorText}`;
   text += `\n\n${options.output}`;
+  const cleanup = buildTerminalCleanupReminder(options);
+  if (cleanup) text += `\n\n${cleanup}`;
   return text;
 }
