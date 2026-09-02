@@ -1,0 +1,12 @@
+{
+  "defaultModel": "gpt-5.6-sol",
+  "defaultProvider": "openai-codex",
+  "defaultThinkingLevel": "high",
+  "packages": [
+    "npm:pi-mcp-adapter@2.21.0",
+    "npm:@ollama/pi-web-search",
+    "npm:pi-cursor-sdk",
+    "git:github.com/DietrichGebert/ponytail"
+  ],
+  "theme": "github-dark-default"
+}
