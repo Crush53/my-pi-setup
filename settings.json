@@ -6,7 +6,9 @@
     "npm:pi-mcp-adapter@2.21.0",
     "npm:@ollama/pi-web-search",
     "npm:pi-cursor-sdk",
-    "git:github.com/DietrichGebert/ponytail"
+    "git:github.com/DietrichGebert/ponytail",
+    "/Users/peytonmolino/Projects/pi-herdr-managed-agents"
   ],
+  "extensions": ["-extensions/subagents/index.ts"],
   "theme": "github-dark-default"
 }
